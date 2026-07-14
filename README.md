@@ -21,7 +21,7 @@ Beacon 的首个公开版本为 <code>0.1.0</code>，对应 Git tag
 
 > 开发说明：Beacon 起源于以 vibe coding 为主的探索式开发，部分结构或实现
 > 仍可能存在值得重新审视的地方。当前版本已经过自动化校验和多服务商实机
-> 冒烟测试，但仍属于 Alpha 阶段。欢迎通过 Issue、设计建议或 Pull Request
+> 冒烟测试，但仍属于 Alpha 阶段。欢迎通过 Issue、设计建议或 Pull Requestkkkkkk
 > 指出问题并参与改进。
 
 ## Beacon 适合做什么
