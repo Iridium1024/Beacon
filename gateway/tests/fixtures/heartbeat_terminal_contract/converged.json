@@ -1,0 +1,178 @@
+{
+  "envelope": {
+    "kind": "heartbeat.terminal.export",
+    "metadata": {},
+    "payload": {
+      "candidate": {
+        "candidate_id": "candidate-1",
+        "checkpoint_id": "checkpoint-1",
+        "consumer_readiness": "terminal_ready",
+        "final_decision": "converged",
+        "next_step_preview": "action-1",
+        "reservation_level": "none",
+        "retained_issue_preview": null,
+        "semantic_state": "converged_clean",
+        "source_round": 4,
+        "summary": "clean converged candidate",
+        "supporting_context_refs": [
+          "ctx-1",
+          "ctx-2"
+        ]
+      },
+      "consumer_readiness": "terminal_ready",
+      "decision_rationale": [
+        "rationale-1",
+        "rationale-2"
+      ],
+      "display_metadata": {
+        "display_decision_rationale_count": 2,
+        "display_decision_rationale_limit": 3,
+        "display_decision_rationale_truncated": false,
+        "display_omit_empty_sections": true,
+        "display_omitted_sections": [
+          "reservation_summary",
+          "top_retained_items"
+        ],
+        "display_policy_version": "terminal_v1",
+        "display_recommended_next_actions_count": 2,
+        "display_recommended_next_actions_limit": 3,
+        "display_recommended_next_actions_truncated": false,
+        "display_retained_items_count": 0,
+        "display_retained_items_limit": 2,
+        "display_retained_items_truncated": false,
+        "display_section_count": 3,
+        "display_section_order": [
+          "candidate",
+          "reservation_summary",
+          "top_retained_items",
+          "decision_rationale",
+          "recommended_next_actions"
+        ],
+        "retained_item_count": 0
+      },
+      "display_sections": [
+        {
+          "kind": "candidate",
+          "lines": [
+            "clean converged candidate",
+            "Source round: 4",
+            "Supporting refs: ctx-1, ctx-2",
+            "Next step preview: action-1"
+          ],
+          "title": "Candidate"
+        },
+        {
+          "kind": "decision_rationale",
+          "lines": [
+            "rationale-1",
+            "rationale-2"
+          ],
+          "title": "Decision Rationale"
+        },
+        {
+          "kind": "recommended_next_actions",
+          "lines": [
+            "action-1",
+            "action-2"
+          ],
+          "title": "Recommended Next Actions"
+        }
+      ],
+      "final_decision": "converged",
+      "recommended_next_actions": [
+        "action-1",
+        "action-2"
+      ],
+      "reservation_summary": null,
+      "schema_id": "heartbeat_terminal_export_v1",
+      "top_retained_items": []
+    },
+    "protocol_version": "1.0",
+    "request_id": "fixture-converged"
+  },
+  "export": {
+    "candidate": {
+      "candidate_id": "candidate-1",
+      "checkpoint_id": "checkpoint-1",
+      "consumer_readiness": "terminal_ready",
+      "final_decision": "converged",
+      "next_step_preview": "action-1",
+      "reservation_level": "none",
+      "retained_issue_preview": null,
+      "semantic_state": "converged_clean",
+      "source_round": 4,
+      "summary": "clean converged candidate",
+      "supporting_context_refs": [
+        "ctx-1",
+        "ctx-2"
+      ]
+    },
+    "consumer_readiness": "terminal_ready",
+    "decision_rationale": [
+      "rationale-1",
+      "rationale-2"
+    ],
+    "display_metadata": {
+      "display_decision_rationale_count": 2,
+      "display_decision_rationale_limit": 3,
+      "display_decision_rationale_truncated": false,
+      "display_omit_empty_sections": true,
+      "display_omitted_sections": [
+        "reservation_summary",
+        "top_retained_items"
+      ],
+      "display_policy_version": "terminal_v1",
+      "display_recommended_next_actions_count": 2,
+      "display_recommended_next_actions_limit": 3,
+      "display_recommended_next_actions_truncated": false,
+      "display_retained_items_count": 0,
+      "display_retained_items_limit": 2,
+      "display_retained_items_truncated": false,
+      "display_section_count": 3,
+      "display_section_order": [
+        "candidate",
+        "reservation_summary",
+        "top_retained_items",
+        "decision_rationale",
+        "recommended_next_actions"
+      ],
+      "retained_item_count": 0
+    },
+    "display_sections": [
+      {
+        "kind": "candidate",
+        "lines": [
+          "clean converged candidate",
+          "Source round: 4",
+          "Supporting refs: ctx-1, ctx-2",
+          "Next step preview: action-1"
+        ],
+        "title": "Candidate"
+      },
+      {
+        "kind": "decision_rationale",
+        "lines": [
+          "rationale-1",
+          "rationale-2"
+        ],
+        "title": "Decision Rationale"
+      },
+      {
+        "kind": "recommended_next_actions",
+        "lines": [
+          "action-1",
+          "action-2"
+        ],
+        "title": "Recommended Next Actions"
+      }
+    ],
+    "final_decision": "converged",
+    "recommended_next_actions": [
+      "action-1",
+      "action-2"
+    ],
+    "reservation_summary": null,
+    "schema_id": "heartbeat_terminal_export_v1",
+    "top_retained_items": []
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "name": "@agent-os/gateway",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run test:platform",
+    "test:platform": "npm run build && node --test dist/tests/platform-invocation-route.test.js dist/tests/local-platform-route.test.js dist/tests/local-platform-api-contract.test.js dist/tests/gateway-config.test.js dist/tests/local-platform-python-bridge-adapter.test.js dist/tests/local-platform-http-smoke.test.js",
+    "test:platform-route": "npm run build && node --test dist/tests/platform-invocation-route.test.js dist/tests/local-platform-route.test.js dist/tests/local-platform-api-contract.test.js dist/tests/gateway-config.test.js",
+    "test:platform-bridge": "npm run build && node --test dist/tests/local-platform-python-bridge-adapter.test.js dist/tests/local-platform-http-smoke.test.js",
+    "test:legacy-heartbeat": "npm run build && node --test dist/tests/heartbeat-terminal-export-consumer.test.js",
+    "start": "node dist/src/main.js"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "^5.6.3"
+  }
+}

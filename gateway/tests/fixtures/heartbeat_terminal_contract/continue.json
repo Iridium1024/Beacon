@@ -1,0 +1,226 @@
+{
+  "envelope": {
+    "kind": "heartbeat.terminal.export",
+    "metadata": {},
+    "payload": {
+      "candidate": {
+        "candidate_id": "candidate-1",
+        "checkpoint_id": "checkpoint-1",
+        "consumer_readiness": "continue_only",
+        "final_decision": "continue",
+        "next_step_preview": "action-1",
+        "reservation_level": "elevated",
+        "retained_issue_preview": "incompleteness summary",
+        "semantic_state": "continue_due_to_unresolved_gap",
+        "source_round": 4,
+        "summary": "candidate summary",
+        "supporting_context_refs": [
+          "ctx-1",
+          "ctx-2"
+        ]
+      },
+      "consumer_readiness": "continue_only",
+      "decision_rationale": [
+        "rationale-1",
+        "rationale-2"
+      ],
+      "display_metadata": {
+        "display_decision_rationale_count": 2,
+        "display_decision_rationale_limit": 3,
+        "display_decision_rationale_truncated": false,
+        "display_omit_empty_sections": true,
+        "display_omitted_sections": [],
+        "display_policy_version": "terminal_v1",
+        "display_recommended_next_actions_count": 2,
+        "display_recommended_next_actions_limit": 3,
+        "display_recommended_next_actions_truncated": false,
+        "display_retained_items_count": 1,
+        "display_retained_items_limit": 2,
+        "display_retained_items_truncated": false,
+        "display_section_count": 5,
+        "display_section_order": [
+          "candidate",
+          "reservation_summary",
+          "top_retained_items",
+          "decision_rationale",
+          "recommended_next_actions"
+        ],
+        "retained_item_count": 1
+      },
+      "display_sections": [
+        {
+          "kind": "candidate",
+          "lines": [
+            "candidate summary",
+            "Source round: 4",
+            "Supporting refs: ctx-1, ctx-2",
+            "Retained issue preview: incompleteness summary",
+            "Next step preview: action-1"
+          ],
+          "title": "Candidate"
+        },
+        {
+          "kind": "reservation_summary",
+          "lines": [
+            "Unresolved retained items remain in the continue path and should be handled in priority order."
+          ],
+          "title": "Reservation Summary"
+        },
+        {
+          "kind": "top_retained_items",
+          "lines": [
+            "incompleteness summary"
+          ],
+          "title": "Top Retained Items"
+        },
+        {
+          "kind": "decision_rationale",
+          "lines": [
+            "rationale-1",
+            "rationale-2"
+          ],
+          "title": "Decision Rationale"
+        },
+        {
+          "kind": "recommended_next_actions",
+          "lines": [
+            "action-1",
+            "action-2"
+          ],
+          "title": "Recommended Next Actions"
+        }
+      ],
+      "final_decision": "continue",
+      "recommended_next_actions": [
+        "action-1",
+        "action-2"
+      ],
+      "reservation_summary": "Unresolved retained items remain in the continue path and should be handled in priority order.",
+      "schema_id": "heartbeat_terminal_export_v1",
+      "top_retained_items": [
+        {
+          "blocker": false,
+          "category": "incompleteness",
+          "impact_on_decision": "incompleteness impact",
+          "priority_rank": 1,
+          "severity": "major",
+          "summary": "incompleteness summary",
+          "supporting_roles": [
+            "reviewer"
+          ]
+        }
+      ]
+    },
+    "protocol_version": "1.0",
+    "request_id": "fixture-continue"
+  },
+  "export": {
+    "candidate": {
+      "candidate_id": "candidate-1",
+      "checkpoint_id": "checkpoint-1",
+      "consumer_readiness": "continue_only",
+      "final_decision": "continue",
+      "next_step_preview": "action-1",
+      "reservation_level": "elevated",
+      "retained_issue_preview": "incompleteness summary",
+      "semantic_state": "continue_due_to_unresolved_gap",
+      "source_round": 4,
+      "summary": "candidate summary",
+      "supporting_context_refs": [
+        "ctx-1",
+        "ctx-2"
+      ]
+    },
+    "consumer_readiness": "continue_only",
+    "decision_rationale": [
+      "rationale-1",
+      "rationale-2"
+    ],
+    "display_metadata": {
+      "display_decision_rationale_count": 2,
+      "display_decision_rationale_limit": 3,
+      "display_decision_rationale_truncated": false,
+      "display_omit_empty_sections": true,
+      "display_omitted_sections": [],
+      "display_policy_version": "terminal_v1",
+      "display_recommended_next_actions_count": 2,
+      "display_recommended_next_actions_limit": 3,
+      "display_recommended_next_actions_truncated": false,
+      "display_retained_items_count": 1,
+      "display_retained_items_limit": 2,
+      "display_retained_items_truncated": false,
+      "display_section_count": 5,
+      "display_section_order": [
+        "candidate",
+        "reservation_summary",
+        "top_retained_items",
+        "decision_rationale",
+        "recommended_next_actions"
+      ],
+      "retained_item_count": 1
+    },
+    "display_sections": [
+      {
+        "kind": "candidate",
+        "lines": [
+          "candidate summary",
+          "Source round: 4",
+          "Supporting refs: ctx-1, ctx-2",
+          "Retained issue preview: incompleteness summary",
+          "Next step preview: action-1"
+        ],
+        "title": "Candidate"
+      },
+      {
+        "kind": "reservation_summary",
+        "lines": [
+          "Unresolved retained items remain in the continue path and should be handled in priority order."
+        ],
+        "title": "Reservation Summary"
+      },
+      {
+        "kind": "top_retained_items",
+        "lines": [
+          "incompleteness summary"
+        ],
+        "title": "Top Retained Items"
+      },
+      {
+        "kind": "decision_rationale",
+        "lines": [
+          "rationale-1",
+          "rationale-2"
+        ],
+        "title": "Decision Rationale"
+      },
+      {
+        "kind": "recommended_next_actions",
+        "lines": [
+          "action-1",
+          "action-2"
+        ],
+        "title": "Recommended Next Actions"
+      }
+    ],
+    "final_decision": "continue",
+    "recommended_next_actions": [
+      "action-1",
+      "action-2"
+    ],
+    "reservation_summary": "Unresolved retained items remain in the continue path and should be handled in priority order.",
+    "schema_id": "heartbeat_terminal_export_v1",
+    "top_retained_items": [
+      {
+        "blocker": false,
+        "category": "incompleteness",
+        "impact_on_decision": "incompleteness impact",
+        "priority_rank": 1,
+        "severity": "major",
+        "summary": "incompleteness summary",
+        "supporting_roles": [
+          "reviewer"
+        ]
+      }
+    ]
+  }
+}

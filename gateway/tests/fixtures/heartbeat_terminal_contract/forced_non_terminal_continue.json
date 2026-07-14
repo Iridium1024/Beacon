@@ -1,0 +1,174 @@
+{
+  "envelope": {
+    "kind": "heartbeat.terminal.export",
+    "metadata": {},
+    "payload": {
+      "candidate": {
+        "candidate_id": "candidate-1",
+        "checkpoint_id": "checkpoint-1",
+        "consumer_readiness": "continue_only",
+        "final_decision": "continue",
+        "next_step_preview": "Resume discussion and collect fresh role-specific heartbeat judgments.",
+        "reservation_level": "none",
+        "retained_issue_preview": "Approval support remained insufficient; collect stronger support before the next heartbeat.",
+        "semantic_state": "continue_due_to_insufficient_support",
+        "source_round": null,
+        "summary": "candidate summary",
+        "supporting_context_refs": []
+      },
+      "consumer_readiness": "continue_only",
+      "decision_rationale": [
+        "No eligible heartbeat judgments were available, so discussion remains active."
+      ],
+      "display_metadata": {
+        "display_decision_rationale_count": 1,
+        "display_decision_rationale_limit": 3,
+        "display_decision_rationale_truncated": false,
+        "display_omit_empty_sections": true,
+        "display_omitted_sections": [
+          "top_retained_items"
+        ],
+        "display_policy_version": "terminal_v1",
+        "display_recommended_next_actions_count": 1,
+        "display_recommended_next_actions_limit": 3,
+        "display_recommended_next_actions_truncated": false,
+        "display_retained_items_count": 0,
+        "display_retained_items_limit": 2,
+        "display_retained_items_truncated": false,
+        "display_section_count": 4,
+        "display_section_order": [
+          "candidate",
+          "reservation_summary",
+          "top_retained_items",
+          "decision_rationale",
+          "recommended_next_actions"
+        ],
+        "retained_item_count": 0
+      },
+      "display_sections": [
+        {
+          "kind": "candidate",
+          "lines": [
+            "candidate summary",
+            "Retained issue preview: Approval support remained insufficient; collect stronger support before the next heartbeat.",
+            "Next step preview: Resume discussion and collect fresh role-specific heartbeat judgments."
+          ],
+          "title": "Candidate"
+        },
+        {
+          "kind": "reservation_summary",
+          "lines": [
+            "Approval support remained insufficient; collect stronger support before the next heartbeat."
+          ],
+          "title": "Reservation Summary"
+        },
+        {
+          "kind": "decision_rationale",
+          "lines": [
+            "No eligible heartbeat judgments were available, so discussion remains active."
+          ],
+          "title": "Decision Rationale"
+        },
+        {
+          "kind": "recommended_next_actions",
+          "lines": [
+            "Resume discussion and collect fresh role-specific heartbeat judgments."
+          ],
+          "title": "Recommended Next Actions"
+        }
+      ],
+      "final_decision": "continue",
+      "recommended_next_actions": [
+        "Resume discussion and collect fresh role-specific heartbeat judgments."
+      ],
+      "reservation_summary": "Approval support remained insufficient; collect stronger support before the next heartbeat.",
+      "schema_id": "heartbeat_terminal_export_v1",
+      "top_retained_items": []
+    },
+    "protocol_version": "1.0",
+    "request_id": "fixture-forced_non_terminal_continue"
+  },
+  "export": {
+    "candidate": {
+      "candidate_id": "candidate-1",
+      "checkpoint_id": "checkpoint-1",
+      "consumer_readiness": "continue_only",
+      "final_decision": "continue",
+      "next_step_preview": "Resume discussion and collect fresh role-specific heartbeat judgments.",
+      "reservation_level": "none",
+      "retained_issue_preview": "Approval support remained insufficient; collect stronger support before the next heartbeat.",
+      "semantic_state": "continue_due_to_insufficient_support",
+      "source_round": null,
+      "summary": "candidate summary",
+      "supporting_context_refs": []
+    },
+    "consumer_readiness": "continue_only",
+    "decision_rationale": [
+      "No eligible heartbeat judgments were available, so discussion remains active."
+    ],
+    "display_metadata": {
+      "display_decision_rationale_count": 1,
+      "display_decision_rationale_limit": 3,
+      "display_decision_rationale_truncated": false,
+      "display_omit_empty_sections": true,
+      "display_omitted_sections": [
+        "top_retained_items"
+      ],
+      "display_policy_version": "terminal_v1",
+      "display_recommended_next_actions_count": 1,
+      "display_recommended_next_actions_limit": 3,
+      "display_recommended_next_actions_truncated": false,
+      "display_retained_items_count": 0,
+      "display_retained_items_limit": 2,
+      "display_retained_items_truncated": false,
+      "display_section_count": 4,
+      "display_section_order": [
+        "candidate",
+        "reservation_summary",
+        "top_retained_items",
+        "decision_rationale",
+        "recommended_next_actions"
+      ],
+      "retained_item_count": 0
+    },
+    "display_sections": [
+      {
+        "kind": "candidate",
+        "lines": [
+          "candidate summary",
+          "Retained issue preview: Approval support remained insufficient; collect stronger support before the next heartbeat.",
+          "Next step preview: Resume discussion and collect fresh role-specific heartbeat judgments."
+        ],
+        "title": "Candidate"
+      },
+      {
+        "kind": "reservation_summary",
+        "lines": [
+          "Approval support remained insufficient; collect stronger support before the next heartbeat."
+        ],
+        "title": "Reservation Summary"
+      },
+      {
+        "kind": "decision_rationale",
+        "lines": [
+          "No eligible heartbeat judgments were available, so discussion remains active."
+        ],
+        "title": "Decision Rationale"
+      },
+      {
+        "kind": "recommended_next_actions",
+        "lines": [
+          "Resume discussion and collect fresh role-specific heartbeat judgments."
+        ],
+        "title": "Recommended Next Actions"
+      }
+    ],
+    "final_decision": "continue",
+    "recommended_next_actions": [
+      "Resume discussion and collect fresh role-specific heartbeat judgments."
+    ],
+    "reservation_summary": "Approval support remained insufficient; collect stronger support before the next heartbeat.",
+    "schema_id": "heartbeat_terminal_export_v1",
+    "top_retained_items": []
+  }
+}

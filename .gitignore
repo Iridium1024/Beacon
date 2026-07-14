@@ -1,0 +1,47 @@
+# Beacon local runtime state
+.beacon/
+**/.beacon/
+.agent_os/
+**/.agent_os/
+*.local-runtime.json
+provider-session-registry.json
+runtime/
+workspace/
+plugins/
+*.sqlite3
+*.sqlite3-*
+daemon-logs/
+.smoke/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Node / Gateway
+node_modules/
+dist/
+coverage/
+.npm/
+
+# Logs and local output
+*.log
+logs/
+output/
+codex-output/
+tmp/
+temp/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-os.local/contracts/runtime-envelope.schema.json",
+  "title": "Agent OS Runtime Envelope",
+  "type": "object",
+  "required": [
+    "protocolVersion",
+    "requestId",
+    "kind",
+    "payload"
+  ],
+  "properties": {
+    "protocolVersion": {
+      "type": "string",
+      "description": "Version of the cross-runtime envelope contract."
+    },
+    "requestId": {
+      "type": "string",
+      "description": "Correlation identifier scoped to the transport exchange."
+    },
+    "kind": {
+      "type": "string",
+      "description": "Semantic payload kind such as workflow.submit or agent.register. The kind identifies an explicit object or action, not an embedding-only payload."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Transport-safe explicit semantic payload emitted by the gateway or core. Embeddings or vector fragments, if present, are supplemental rather than authoritative control inputs."
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Opaque metadata preserved across protocol adapters. Metadata may annotate canonical objects but does not replace them."
+    }
+  },
+  "additionalProperties": false
+}

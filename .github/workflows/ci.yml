@@ -1,0 +1,97 @@
+name: Beacon CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: beacon-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install editable Beacon Python core
+        run: python -m pip install --upgrade pip && python -m pip install -e ./python-core
+      - name: Verify console and module entrypoints
+        run: |
+          beacon --help
+          beacon --version
+          python -m agent_os.local_runtime --help
+      - name: Run local runtime smoke
+        run: beacon --database runtime/state/local-platform.sqlite3 --workspace-root workspace/sandboxes/local-platform --plugins-directory plugins smoke
+      - name: Run Python regression suite
+        run: python -m unittest discover -s python-core/tests
+
+  release-hygiene:
+    name: Release hygiene and wheel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build
+      - name: Check version consistency
+        run: python scripts/check_versions.py
+      - name: Check release hygiene
+        run: python scripts/release_check.py --strict
+      - name: Build Python source and wheel distributions
+        run: python -m build python-core --outdir dist
+      - name: Install wheel in an isolated environment
+        run: |
+          python -m venv .package-venv
+          .package-venv/bin/python -m pip install dist/*.whl
+          .package-venv/bin/beacon --help
+          .package-venv/bin/beacon --version
+
+  gateway:
+    name: Gateway Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    defaults:
+      run:
+        working-directory: gateway
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: gateway/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Build Gateway
+        run: npm run build
+      - name: Type-check Gateway
+        run: npm run check
+      - name: Run platform route tests
+        run: npm run test:platform-route
+      - name: Run Python bridge tests
+        run: npm run test:platform-bridge

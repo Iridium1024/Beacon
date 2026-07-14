@@ -1,0 +1,108 @@
+{
+  "contract_name": "heartbeat_terminal_export",
+  "schema_id": "heartbeat_terminal_export_v1",
+  "envelope": {
+    "kind": "heartbeat.terminal.export",
+    "protocol_version": "1.0",
+    "body_location": "payload"
+  },
+  "payload": {
+    "required_fields": [
+      "schema_id",
+      "final_decision",
+      "consumer_readiness",
+      "candidate",
+      "decision_rationale",
+      "recommended_next_actions",
+      "top_retained_items",
+      "reservation_summary",
+      "display_sections",
+      "display_metadata"
+    ],
+    "candidate": {
+      "required_fields": [
+        "candidate_id",
+        "checkpoint_id",
+        "summary",
+        "source_round",
+        "supporting_context_refs",
+        "final_decision",
+        "semantic_state",
+        "reservation_level",
+        "consumer_readiness",
+        "retained_issue_preview",
+        "next_step_preview"
+      ]
+    },
+    "section_vocabulary": [
+      "candidate",
+      "decision_rationale",
+      "reservation_summary",
+      "top_retained_items",
+      "recommended_next_actions"
+    ],
+    "display_metadata": {
+      "required_keys": [
+        "display_policy_version",
+        "display_section_order",
+        "display_omit_empty_sections",
+        "display_retained_items_limit",
+        "display_decision_rationale_limit",
+        "display_recommended_next_actions_limit",
+        "display_section_count",
+        "retained_item_count",
+        "display_retained_items_count",
+        "display_retained_items_truncated",
+        "display_decision_rationale_count",
+        "display_decision_rationale_truncated",
+        "display_recommended_next_actions_count",
+        "display_recommended_next_actions_truncated",
+        "display_omitted_sections"
+      ],
+      "display_policy_version_key": "display_policy_version",
+      "display_section_order_key": "display_section_order",
+      "display_omit_empty_sections_key": "display_omit_empty_sections",
+      "display_omit_empty_sections_value": true,
+      "display_section_count_key": "display_section_count",
+      "retained_item_count_key": "retained_item_count",
+      "omission_rules": {
+        "metadata_key": "display_omitted_sections",
+        "non_omittable_sections": [
+          "candidate"
+        ]
+      },
+      "truncation_rules": {
+        "display_retained_items_truncated": {
+          "count_key": "display_retained_items_count",
+          "collection_field": "top_retained_items",
+          "limit_key": "display_retained_items_limit",
+          "section_kind": "top_retained_items"
+        },
+        "display_decision_rationale_truncated": {
+          "count_key": "display_decision_rationale_count",
+          "collection_field": "decision_rationale",
+          "limit_key": "display_decision_rationale_limit",
+          "section_kind": "decision_rationale"
+        },
+        "display_recommended_next_actions_truncated": {
+          "count_key": "display_recommended_next_actions_count",
+          "collection_field": "recommended_next_actions",
+          "limit_key": "display_recommended_next_actions_limit",
+          "section_kind": "recommended_next_actions"
+        }
+      }
+    }
+  },
+  "compatibility": {
+    "compatible_additions": [
+      "Adding optional top-level payload fields is compatible when every required field, schema_id, and existing field meaning remains unchanged.",
+      "Adding optional display_metadata keys is compatible when the current metadata keys, display section ordering, and omission or truncation semantics remain unchanged.",
+      "Adding envelope metadata keys is compatible when the terminal export body remains at ProtocolEnvelope.payload and the envelope kind remains unchanged."
+    ],
+    "breaking_changes": [
+      "Renaming, removing, or changing type or meaning of any required payload field is breaking.",
+      "Changing schema_id, ProtocolEnvelope.kind, ProtocolEnvelope.protocol_version, or moving the export body away from ProtocolEnvelope.payload is breaking.",
+      "Changing omission or truncation flag semantics, or reordering rendered sections outside display_metadata.display_section_order, is breaking."
+    ]
+  }
+}
