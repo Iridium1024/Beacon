@@ -9,11 +9,12 @@ Beacon 当前是 Alpha 阶段的本地工具。安全修复将应用于默认分
 
 ## 私密报告安全问题
 
-请发送邮件至 [2335980262@qq.com](mailto:2335980262@qq.com) 私密报告漏洞。
-不要在公开 Issue 中提交凭据、令牌、Cookie、完整对话、服务商会话注册表、
-SQLite 数据库、本地配置、唤醒票据或日志。除非这些信息对复现问题确有必要，
-并且维护者已通过私密渠道明确提出要求，否则请移除账号标识、会话标识、
-本地路径和私有模型内容。
+请通过 GitHub 仓库 Security 页面中的
+[Report a vulnerability](https://github.com/Iridium1024/Beacon/security/advisories/new)
+私密报告安全问题。不要在公开 Issue 中提交凭据、令牌、Cookie、完整对话、
+服务商会话注册表、SQLite 数据库、本地配置、唤醒票据或日志。除非这些信息
+对复现问题确有必要，并且维护者已通过私密渠道明确提出要求，否则请移除
+账号标识、会话标识、本地路径和私有模型内容。
 
 维护者会在精力允许时查看报告。Beacon 不承诺固定的确认回复或修复时限；
 已经确认的问题将根据影响程度和维护者当时可投入的精力安排优先级。
@@ -44,13 +45,14 @@ builds are not supported release lines.
 
 ## Reporting A Vulnerability
 
-Report vulnerabilities privately by email at
-[2335980262@qq.com](mailto:2335980262@qq.com). Do not open a public issue
-containing credentials, tokens, cookies, complete transcripts, provider
-registries, SQLite databases, local profiles, wake tickets, or logs. Remove
-account identifiers, session identifiers, local paths, and private model
-content from any reproduction unless they are essential and explicitly
-requested through the private channel.
+Report security vulnerabilities privately using
+[Report a vulnerability](https://github.com/Iridium1024/Beacon/security/advisories/new)
+on the repository's Security page. Do not open a public issue containing
+credentials, tokens, cookies, complete transcripts, provider registries,
+SQLite databases, local profiles, wake tickets, or logs. Remove account
+identifiers, session identifiers, local paths, and private model content from
+any reproduction unless they are essential and explicitly requested through
+the private channel.
 
 Reports are reviewed as availability permits. Beacon does not promise a fixed
 acknowledgement or remediation timeline. Confirmed issues will be prioritized
