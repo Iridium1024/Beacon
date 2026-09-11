@@ -130,7 +130,9 @@ class AgentEndpointRecord:
         alias = normalize_agent_endpoint_alias(self.alias)
         provider = normalize_agent_endpoint_provider(self.provider)
         if provider is None:
-            raise ValueError("provider must be one of: claude, codex, hermes.")
+            raise ValueError(
+                "provider must be one of: claude, codex, hermes, deepseek_harness."
+            )
         direction = _enum_value(
             AgentEndpointDirection,
             _normalize_enum_text(str(self.direction)),
@@ -227,6 +229,12 @@ def normalize_agent_endpoint_provider(value: str | None) -> str | None:
         return "codex"
     if normalized in {"hermes", "hermes-cli", "hermes-desktop"}:
         return "hermes"
+    if normalized in {
+        "deepseek-harness",
+        "deepseek-harness-sdk",
+        "dsh",
+    }:
+        return "deepseek_harness"
     return None
 
 

@@ -53,11 +53,19 @@ class PlatformEventKind(StrEnum):
     CODEX_REGISTERED_SESSION_ACTIVATION_RECORDED = (
         "codex_registered_session_activation.recorded"
     )
+    CODEX_APP_SERVER_RUNTIME_CHANGED = "codex_app_server_runtime.changed"
+    CODEX_SESSION_SUPPLEMENT_CHANGED = "codex_session_supplement.changed"
     HERMES_REGISTERED_SESSION_HANDLE_CHANGED = (
         "hermes_registered_session_handle.changed"
     )
     HERMES_REGISTERED_SESSION_ACTIVATION_RECORDED = (
         "hermes_registered_session_activation.recorded"
+    )
+    DEEPSEEK_HARNESS_REGISTERED_SESSION_HANDLE_CHANGED = (
+        "deepseek_harness_registered_session_handle.changed"
+    )
+    DEEPSEEK_HARNESS_RUNTIME_LIFECYCLE_RECORDED = (
+        "deepseek_harness_runtime_lifecycle.recorded"
     )
 
 

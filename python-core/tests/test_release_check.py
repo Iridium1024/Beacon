@@ -76,6 +76,16 @@ class ReleaseCheckTests(unittest.TestCase):
 
             self.assertIn("local_user_path", {item.code for item in findings})
 
+            (root / "leak.md").write_text(
+                "machine path: " + "E:/" + "Documents/" + "LocalProject",
+                encoding="utf-8",
+            )
+            findings = []
+
+            MODULE._scan_text_files(root, (root / "leak.md",), findings)
+
+            self.assertIn("local_windows_path", {item.code for item in findings})
+
     def test_generated_package_directories_are_not_scanned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -13,6 +13,9 @@ from typing import Mapping, Sequence
 from agent_os.application.services.provider_permission_profiles import (
     default_provider_permission_profile_metadata,
 )
+from agent_os.application.services.claude_agent_sdk_backend import (
+    probe_claude_agent_sdk_runtime,
+)
 
 
 SUPPORTED_AGENT_RUNTIME_TOOLS = (
@@ -143,6 +146,8 @@ def _activation_capability_checks(
         result.tool: default_provider_permission_profile_metadata(result.tool)
         for result in results
     }
+    codex_result = next((result for result in results if result.tool == "codex"), None)
+    claude_result = next((result for result in results if result.tool == "claude"), None)
     return {
         "schema": "agent_runtime_activation_capabilities.v1",
         "ticketPathReadable": _ticket_path_readable(ticket_path),
@@ -160,7 +165,160 @@ def _activation_capability_checks(
             for result in results
         },
         "providerPermissionProfiles": provider_permission_profiles,
+        "providerProtocolChecks": {
+            "claudeAgentSdk": _claude_agent_sdk_check_for_result(claude_result),
+            "codexAppServer": _codex_app_server_check_for_result(
+                codex_result,
+                timeout_seconds=timeout_seconds,
+            )
+        },
     }
+
+
+def _claude_agent_sdk_check_for_result(
+    result: AgentRuntimeToolPreflight | None,
+) -> Mapping[str, object]:
+    if result is None:
+        return {
+            "schema": "claude_agent_sdk_preflight.v1",
+            "readOnly": True,
+            "probeAttempted": False,
+            "sessionStarted": False,
+            "status": "not_requested",
+            "installed": False,
+            "compatible": False,
+        }
+    candidate = next(
+        (
+            item
+            for item in result.candidates
+            if item.path == result.recommended_executable
+        ),
+        None,
+    )
+    return {
+        **dict(probe_claude_agent_sdk_runtime()),
+        "providerCli": {
+            "activationReady": result.activation_ready,
+            "recommendedExecutable": result.recommended_executable,
+            "version": candidate.version if candidate is not None else None,
+            "sdkDefault": "bundled_executable",
+        },
+    }
+
+
+def _codex_app_server_check_for_result(
+    result: AgentRuntimeToolPreflight | None,
+    *,
+    timeout_seconds: float,
+) -> Mapping[str, object]:
+    if (
+        result is None
+        or not result.activation_ready
+        or result.recommended_executable is None
+    ):
+        return {
+            "schema": "codex_app_server_preflight.v1",
+            "readOnly": True,
+            "probeAttempted": False,
+            "status": "not_available",
+            "compatible": False,
+            "executable": (
+                result.recommended_executable if result is not None else None
+            ),
+            "version": None,
+            "stdioTransportAvailable": False,
+            "jsonSchemaGenerationAvailable": False,
+        }
+    candidate = next(
+        (
+            item
+            for item in result.candidates
+            if item.path == result.recommended_executable
+        ),
+        None,
+    )
+    return probe_codex_app_server_surface(
+        result.recommended_executable,
+        version=candidate.version if candidate is not None else None,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def probe_codex_app_server_surface(
+    executable: str,
+    *,
+    version: str | None = None,
+    timeout_seconds: float = 8.0,
+) -> Mapping[str, object]:
+    """Read-only probe for the Codex app-server surface used by Beacon."""
+
+    base: dict[str, object] = {
+        "schema": "codex_app_server_preflight.v1",
+        "readOnly": True,
+        "probeAttempted": True,
+        "executable": executable,
+        "version": version,
+        "stdioTransportAvailable": False,
+        "jsonSchemaGenerationAvailable": False,
+    }
+    try:
+        completed = subprocess.run(
+            (executable, "app-server", "--help"),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            shell=False,
+            timeout=timeout_seconds,
+            **_subprocess_platform_kwargs(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            **base,
+            "status": "probe_failed",
+            "compatible": False,
+            "error": f"TimeoutExpired: app-server help exceeded {exc.timeout} seconds",
+        }
+    except OSError as exc:
+        return {
+            **base,
+            "status": "probe_failed",
+            "compatible": False,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+    raw = stdout or stderr
+    if completed.returncode != 0:
+        return {
+            **base,
+            "status": "probe_failed",
+            "compatible": False,
+            "exitCode": completed.returncode,
+            "error": _last_lines(raw or f"exit code {completed.returncode}", 4),
+        }
+
+    normalized = raw.lower()
+    stdio_available = "stdio://" in normalized or "--stdio" in normalized
+    schema_available = "generate-json-schema" in normalized
+    compatible = stdio_available and schema_available
+    result = {
+        **base,
+        "status": "available" if compatible else "missing_required_surface",
+        "compatible": compatible,
+        "exitCode": completed.returncode,
+        "stdioTransportAvailable": stdio_available,
+        "jsonSchemaGenerationAvailable": schema_available,
+    }
+    if not compatible:
+        result["warning"] = (
+            "Codex app-server help did not expose the stdio transport and "
+            "generate-json-schema surface expected by Beacon."
+        )
+    return result
 
 
 def _ticket_path_readable(ticket_path: str | None) -> Mapping[str, object]:

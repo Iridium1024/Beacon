@@ -38,6 +38,7 @@ SKIP_DIRECTORIES = {
     ".mypy_cache",
     ".pytest_cache",
     ".ruff_cache",
+    ".runtime",
     ".venv",
     ".package-venv",
     "__pycache__",
@@ -45,6 +46,7 @@ SKIP_DIRECTORIES = {
     "coverage",
     "dist",
     "node_modules",
+    "target",
 }
 GENERATED_TOP_LEVEL_DIRECTORIES = {
     ".agent_os",
@@ -278,7 +280,7 @@ def _scan_text_files(root: Path, files: Sequence[Path], findings: list[Finding])
     internal_terms = ("\u8d44\u6e90\u6c60", "\u81ea\u52a8\u5316\u65e5\u5fd7")
     forbidden_patterns = (
         ("fixed_f_drive_path", re.compile(r"\bF:[\\/]", re.IGNORECASE)),
-        ("local_windows_path", re.compile(r"[A-Za-z]:[\\/]+Documents[\\/]+Agent Chat", re.IGNORECASE)),
+        ("local_windows_path", re.compile(r"[A-Za-z]:[\\/]+Documents[\\/]+", re.IGNORECASE)),
         ("local_user_path", re.compile(r"C:[\\/]+Users[\\/]+(?!FixtureUser(?:[\\/]|$))", re.IGNORECASE)),
         ("local_home_path", re.compile(r"/home/[A-Za-z0-9._-]+/")),
         ("migration_state_reference", re.compile(r"migration_state\.json", re.IGNORECASE)),

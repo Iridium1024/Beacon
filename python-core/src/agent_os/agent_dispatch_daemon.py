@@ -17,7 +17,12 @@ from agent_os.application.services.agent_provider_runtime_status import (
 )
 from agent_os.infrastructure.config import LocalPlatformSettings
 from agent_os.local_runtime import (
+    _claude_control_config,
+    _codex_activation_backend,
+    _codex_app_server_approval_decision,
+    _codex_control_config,
     _codex_git_repo_check_policy,
+    _hermes_control_config,
     _local_runtime_profile,
     _profile_path_from_argv,
     _runtime_setting,
@@ -99,8 +104,16 @@ def _run_daemon(
 ) -> int:
     poll_interval_ms = args.poll_interval_ms
     heartbeat_interval_ms = args.heartbeat_interval_ms or poll_interval_ms
+    local_profile = _local_runtime_profile(profile_path)
     codex_repo_check_policy, codex_repo_check_policy_source = (
-        _codex_git_repo_check_policy(args, _local_runtime_profile(profile_path))
+        _codex_git_repo_check_policy(args, local_profile)
+    )
+    codex_control = _codex_control_config(args, local_profile)
+    claude_control = _claude_control_config(args, local_profile)
+    hermes_control = _hermes_control_config(args, local_profile)
+    codex_activation_backend = codex_control.activation_backend.value
+    codex_app_server_approval_decision, _ = (
+        _codex_app_server_approval_decision(args, local_profile)
     )
     started_at = _utc_now()
     process_hint = _process_hint(profile_path=profile_path)
@@ -150,6 +163,8 @@ def _run_daemon(
             claude_allowed_tools=tuple(args.claude_allowed_tool),
             claude_permission_mode=args.claude_permission_mode,
             claude_settings_path=args.claude_settings_path,
+            claude_activation_backend=claude_control.activation_backend.value,
+            claude_reply_writeback_mode=claude_control.reply_writeback_mode.value,
             codex_executable=args.codex_executable,
             codex_default_platform_workspace_add_dir=(
                 not args.no_codex_default_platform_workspace_add_dir
@@ -159,8 +174,21 @@ def _run_daemon(
             codex_approval_policy=args.codex_approval_policy,
             codex_git_repo_check_policy=codex_repo_check_policy,
             codex_git_repo_check_policy_source=codex_repo_check_policy_source,
+            codex_activation_backend=codex_activation_backend,
+            codex_app_server_approval_decision=(
+                codex_app_server_approval_decision
+            ),
+            codex_busy_delivery_policy=codex_control.busy_delivery_policy.value,
+            codex_reply_writeback_mode=codex_control.reply_writeback_mode.value,
             hermes_executable=args.hermes_executable,
             hermes_home=args.hermes_home,
+            hermes_activation_backend=hermes_control.activation_backend.value,
+            hermes_reply_writeback_mode=hermes_control.reply_writeback_mode.value,
+            hermes_gateway_python=(
+                hermes_control.gateway_python.value
+                if hermes_control.gateway_python is not None
+                else None
+            ),
             hermes_source_tag=args.hermes_source_tag,
             hermes_max_turns=args.hermes_max_turns,
             activation_timeout_seconds=args.activation_timeout_seconds,
@@ -168,6 +196,12 @@ def _run_daemon(
             read_live_runtime_status=args.runtime_status_policy,
             dry_run=args.dry_run,
         )
+        result = {
+            **dict(result),
+            "claudeControl": claude_control.to_metadata(),
+            "codexControl": codex_control.to_metadata(),
+            "hermesControl": hermes_control.to_metadata(),
+        }
         poll_at = _utc_now()
         lease_reconciliation = result.get("leaseReconciliation")
         application.record_agent_dispatch_daemon_liveness(
@@ -282,6 +316,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--claude-permission-mode")
     parser.add_argument("--claude-settings-path")
     parser.add_argument(
+        "--claude-activation-backend",
+        choices=("cli", "agent_sdk"),
+        help="Select default CLI rollback or the opt-in short-lived Agent SDK.",
+    )
+    parser.add_argument(
+        "--claude-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+        help="Choose receiver-explicit reply or automatic verified final capture.",
+    )
+    parser.add_argument(
         "--codex-executable",
         "--codex-path",
         dest="codex_executable",
@@ -299,12 +343,38 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("skip", "strict"),
     )
     parser.add_argument(
+        "--codex-activation-backend",
+        choices=("exec_resume", "app_server"),
+    )
+    parser.add_argument(
+        "--codex-app-server-approval-decision",
+        choices=("decline", "cancel", "accept", "accept_for_session"),
+    )
+    parser.add_argument(
+        "--codex-busy-delivery-policy",
+        choices=("queue_next_turn", "reject"),
+    )
+    parser.add_argument(
+        "--codex-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    parser.add_argument(
         "--hermes-executable",
         "--hermes-path",
         dest="hermes_executable",
         default="hermes",
     )
     parser.add_argument("--hermes-home")
+    parser.add_argument(
+        "--hermes-activation-backend",
+        choices=("cli", "tui_gateway"),
+        help="Select default CLI rollback or the opt-in short-lived TUI gateway.",
+    )
+    parser.add_argument(
+        "--hermes-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    parser.add_argument("--hermes-gateway-python")
     parser.add_argument("--hermes-source-tag", default="agent-os")
     parser.add_argument("--hermes-max-turns", type=int)
     parser.add_argument("--activation-timeout-seconds", type=int, default=120)

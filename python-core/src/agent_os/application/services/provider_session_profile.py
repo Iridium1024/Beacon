@@ -245,6 +245,11 @@ class ProviderSessionRegistry:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         normalized_provider = _provider(provider)
+        if normalized_provider == "deepseek_harness":
+            raise ValueError(
+                "DeepSeek Harness existing-session profiles cannot be imported; "
+                "create a new Beacon-owned session with agent-join --new-session."
+            )
         session_id = _required_text(provider_session_id, "providerSessionId")
         alias = _profile_alias(profile_alias)
         created_by = _required_text(created_by, "createdBy")

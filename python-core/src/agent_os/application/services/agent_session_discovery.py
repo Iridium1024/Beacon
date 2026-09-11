@@ -19,6 +19,8 @@ AGENT_SESSION_DISCOVERY_DIAGNOSTIC_SCHEMA = (
     "agent_session_discovery_diagnostic.v1"
 )
 HERMES_SESSION_IDENTITY_SCHEMA = "hermes_session_identity.v1"
+CODEX_SESSION_IDENTITY_SCHEMA = "codex_session_identity.v1"
+CLAUDE_SESSION_IDENTITY_SCHEMA = "claude_session_identity.v1"
 
 AGENT_RUNTIME_CHOICES = ("claude", "codex", "hermes")
 AGENT_RUNTIME_ALL = ("claude", "codex", "hermes")
@@ -262,11 +264,15 @@ def discover_agent_sessions(
         record for record in _dedupe_records(records)
         if _record_matches_account_filter(record, account_filter)
     ]
-    sorted_records = sorted(
+    sorted_records = _limit_records_preserving_exact_session(
+        sorted(
         deduped_records,
         key=lambda item: (item.updated_at or "", item.agent_runtime, item.session_id),
         reverse=True,
-    )[:resolved_limit]
+        ),
+        limit=resolved_limit,
+        exact_session_id=resolved_current_session_id,
+    )
     agent_sessions = [record.to_metadata() for record in sorted_records]
     return {
         "agentSessionDiscovery": {
@@ -348,7 +354,14 @@ def discovery_registration_metadata(
     }
     provider_identity = record.get("providerSessionIdentity")
     if isinstance(provider_identity, Mapping):
-        result["hermesSessionIdentity"] = dict(provider_identity)
+        runtime = str(record.get("agentRuntime") or "")
+        identity_key = {
+            "claude": "claudeSessionIdentity",
+            "codex": "codexSessionIdentity",
+            "hermes": "hermesSessionIdentity",
+        }.get(runtime)
+        if identity_key is not None:
+            result[identity_key] = dict(provider_identity)
     return result
 
 
@@ -363,7 +376,8 @@ def _discover_claude_sessions(
     snippet_turn_index: int | None,
     snippet_max_chars: int,
 ) -> list[AgentSessionDiscoveryRecord]:
-    root = _home_path(claude_home, ".claude")
+    root = _home_path(claude_home, ".claude").expanduser().resolve(strict=False)
+    runtime_home_source = "explicit" if _as_text(claude_home) else "provider_default"
     candidates = [
         *(_jsonl_files(root / "projects")),
         *(_jsonl_files(root / "sessions")),
@@ -381,8 +395,7 @@ def _discover_claude_sessions(
         if not session_id:
             continue
         cwd, cwd_source = _resolved_record_cwd(values.get("cwd"), fallback_cwd)
-        records.append(
-            AgentSessionDiscoveryRecord(
+        record = AgentSessionDiscoveryRecord(
                 agent_runtime="claude",
                 session_id=session_id,
                 cwd=cwd,
@@ -407,10 +420,21 @@ def _discover_claude_sessions(
                 metadata={
                     "recordSource": "jsonl_keys",
                     "jsonlScan": _json_object_from_values(values, "jsonl_scan"),
+                    "providerSessionIdentity": _provider_session_identity(
+                        schema=CLAUDE_SESSION_IDENTITY_SCHEMA,
+                        session_id=session_id,
+                        discovery_source="claude_projects_jsonl",
+                        runtime_home=root,
+                        runtime_home_source=runtime_home_source,
+                    ),
                 },
             )
-        )
-        if len(records) >= limit:
+        if len(records) < limit or session_id == current_session_id:
+            records.append(record)
+        if len(records) >= limit and (
+            current_session_id is None
+            or any(item.session_id == current_session_id for item in records)
+        ):
             break
     return records
 
@@ -426,7 +450,7 @@ def _discover_codex_sessions(
     snippet_turn_index: int | None,
     snippet_max_chars: int,
 ) -> list[AgentSessionDiscoveryRecord]:
-    root = _home_path(codex_home, ".codex")
+    root, runtime_home_source = _resolve_codex_runtime_home(codex_home)
     records: list[AgentSessionDiscoveryRecord] = []
     for path in _newest_files(_jsonl_files(root / "sessions")):
         values = _read_jsonl_session_values(
@@ -440,8 +464,7 @@ def _discover_codex_sessions(
         if not session_id:
             continue
         cwd, cwd_source = _resolved_record_cwd(values.get("cwd"), fallback_cwd)
-        records.append(
-            AgentSessionDiscoveryRecord(
+        record = AgentSessionDiscoveryRecord(
                 agent_runtime="codex",
                 session_id=session_id,
                 cwd=cwd,
@@ -466,23 +489,44 @@ def _discover_codex_sessions(
                 metadata={
                     "recordSource": "jsonl_keys",
                     "jsonlScan": _json_object_from_values(values, "jsonl_scan"),
+                    "providerSessionIdentity": _provider_session_identity(
+                        schema=CODEX_SESSION_IDENTITY_SCHEMA,
+                        session_id=session_id,
+                        discovery_source="codex_sessions_jsonl",
+                        runtime_home=root,
+                        runtime_home_source=runtime_home_source,
+                    ),
                 },
             )
-        )
-        if len(records) >= limit:
+        if len(records) < limit or session_id == current_session_id:
+            records.append(record)
+        if len(records) >= limit and (
+            current_session_id is None
+            or any(item.session_id == current_session_id for item in records)
+        ):
             break
 
-    if len(records) < limit:
+    exact_missing = current_session_id is not None and not any(
+        item.session_id == current_session_id for item in records
+    )
+    if len(records) < limit or exact_missing:
         index = root / "session_index.jsonl"
         if index.exists():
             for record in _discover_codex_index_sessions(
                 index,
                 fallback_cwd=fallback_cwd,
-                remaining=limit - len(records),
+                remaining=max(limit - len(records), 1),
                 current_session_id=current_session_id,
+                runtime_home=root,
+                runtime_home_source=runtime_home_source,
             ):
                 records.append(record)
-                if len(records) >= limit:
+                if len(records) >= limit and (
+                    current_session_id is None
+                    or any(
+                        item.session_id == current_session_id for item in records
+                    )
+                ):
                     break
     return records
 
@@ -493,9 +537,25 @@ def _discover_codex_index_sessions(
     fallback_cwd: str | None,
     remaining: int,
     current_session_id: str | None,
+    runtime_home: Path,
+    runtime_home_source: str,
 ) -> list[AgentSessionDiscoveryRecord]:
     records: list[AgentSessionDiscoveryRecord] = []
-    for payload in _iter_jsonl_objects(index_path, limit=max(remaining * 4, 20)):
+    payloads = list(
+        _iter_jsonl_objects(index_path, limit=max(remaining * 4, 20))
+    )
+    if current_session_id is not None and not any(
+        _first_text(payload, ("session_id", "sessionId", "id"))
+        == current_session_id
+        for payload in payloads
+    ):
+        exact_payload = _find_jsonl_object_by_session_id(
+            index_path,
+            current_session_id,
+        )
+        if exact_payload is not None:
+            payloads.insert(0, exact_payload)
+    for payload in payloads:
         session_id = _first_text(payload, ("session_id", "sessionId", "id"))
         if not session_id:
             continue
@@ -523,10 +583,22 @@ def _discover_codex_index_sessions(
                 vendor_account_source=labels.get("vendorSource"),
                 relay_account_label=labels.get("relayLabel"),
                 relay_account_source=labels.get("relaySource"),
-                metadata={"recordSource": "session_index_keys"},
+                metadata={
+                    "recordSource": "session_index_keys",
+                    "providerSessionIdentity": _provider_session_identity(
+                        schema=CODEX_SESSION_IDENTITY_SCHEMA,
+                        session_id=session_id,
+                        discovery_source="codex_session_index_jsonl",
+                        runtime_home=runtime_home,
+                        runtime_home_source=runtime_home_source,
+                    ),
+                },
             )
         )
-        if len(records) >= remaining:
+        if len(records) >= remaining and (
+            current_session_id is None
+            or any(item.session_id == current_session_id for item in records)
+        ):
             break
     return records
 
@@ -589,12 +661,13 @@ def _discover_hermes_sessions(
                 "stateDatabase": str(state_db),
             }
 
+    inventory_limit = limit if current_session_id is None else 2_147_483_647
     command = [
         _required_text(hermes_executable, "hermesExecutable"),
         "sessions",
         "list",
         "--limit",
-        str(limit),
+        str(inventory_limit),
     ]
     if hermes_source:
         command.extend(("--source", hermes_source))
@@ -645,7 +718,7 @@ def _discover_hermes_sessions(
     records = _parse_hermes_sessions_output(
         completed.stdout,
         fallback_cwd=fallback_cwd,
-        limit=limit,
+        limit=inventory_limit,
         current_session_id=current_session_id,
         runtime_home=runtime_home,
         runtime_home_source=runtime_home_source,
@@ -775,6 +848,12 @@ def _discover_hermes_sessions_from_state_db(
         if expected_row is not None
         else None
     )
+    if (
+        expected is not None
+        and (source_filter is None or _as_text(expected.get("source")) == source_filter)
+        and not any(_as_text(item.get("id")) == current_session_id for item in selected)
+    ):
+        selected = [expected, *selected[: max(limit - 1, 0)]]
     if not selected:
         diagnostics.append(
             _hermes_discovery_diagnostic(
@@ -1627,6 +1706,82 @@ def _home_path(configured_home: str | None, default_leaf: str) -> Path:
     if configured_home:
         return Path(configured_home)
     return Path.home() / default_leaf
+
+
+def _resolve_codex_runtime_home(
+    configured_home: str | None,
+) -> tuple[Path, str]:
+    explicit = _as_text(configured_home)
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve(strict=False), "explicit"
+    environment_home = _as_text(os.environ.get("CODEX_HOME"))
+    if environment_home is not None:
+        return (
+            Path(environment_home).expanduser().resolve(strict=False),
+            "process_environment",
+        )
+    return (Path.home() / ".codex").resolve(strict=False), "provider_default"
+
+
+def _provider_session_identity(
+    *,
+    schema: str,
+    session_id: str,
+    discovery_source: str,
+    runtime_home: Path,
+    runtime_home_source: str,
+) -> Mapping[str, object]:
+    return {
+        "schema": schema,
+        "providerSessionId": session_id,
+        "discoverySource": discovery_source,
+        "runtimeHome": str(runtime_home.expanduser().resolve(strict=False)),
+        "runtimeHomeSource": runtime_home_source,
+        "fullSessionHistoryRead": False,
+    }
+
+
+def _limit_records_preserving_exact_session(
+    records: Sequence[AgentSessionDiscoveryRecord],
+    *,
+    limit: int,
+    exact_session_id: str | None,
+) -> list[AgentSessionDiscoveryRecord]:
+    if exact_session_id is None:
+        return list(records[:limit])
+    exact = next(
+        (item for item in records if item.session_id == exact_session_id),
+        None,
+    )
+    if exact is None:
+        return list(records[:limit])
+    remaining = [item for item in records if item is not exact]
+    return [exact, *remaining[: max(limit - 1, 0)]]
+
+
+def _find_jsonl_object_by_session_id(
+    path: Path,
+    session_id: str,
+) -> Mapping[str, object] | None:
+    """Scan an index JSONL for one id without loading histories or the whole file."""
+
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        while True:
+            raw_line = stream.readline(_JSONL_LINE_MAX_BYTES + 1)
+            if not raw_line:
+                return None
+            if len(raw_line) > _JSONL_LINE_MAX_BYTES:
+                while raw_line and not raw_line.endswith("\n"):
+                    raw_line = stream.readline(_JSONL_LINE_MAX_BYTES + 1)
+                continue
+            try:
+                loaded = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(loaded, Mapping):
+                continue
+            if _first_text(loaded, ("session_id", "sessionId", "id")) == session_id:
+                return dict(loaded)
 
 
 def _session_id_from_filename(path: Path) -> str | None:

@@ -227,6 +227,10 @@ class HermesRegisteredSessionActivationAttempt:
     executable_preflight_stdout_tail: str | None = None
     executable_preflight_stderr_tail: str | None = None
     executable_preflight_failure_reason: str | None = None
+    activation_backend: str = "cli"
+    reply_writeback_mode: str = "provider_final_capture"
+    runtime_session_id: str | None = None
+    provider_runtime_metadata: Mapping[str, object] = field(default_factory=dict)
     failure_category: str | None = None
     retryable: bool | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -424,6 +428,31 @@ class HermesRegisteredSessionActivationAttempt:
                 "executable_preflight_failure_reason",
                 "executablePreflightFailureReason",
             ),
+            activation_backend=(
+                _optional_text(config, "activation_backend", "activationBackend")
+                or "cli"
+            ),
+            reply_writeback_mode=(
+                _optional_text(
+                    config,
+                    "reply_writeback_mode",
+                    "replyWritebackMode",
+                )
+                or "provider_final_capture"
+            ),
+            runtime_session_id=_optional_text(
+                config,
+                "runtime_session_id",
+                "runtimeSessionId",
+            ),
+            provider_runtime_metadata=dict(
+                _optional_mapping(
+                    config,
+                    "provider_runtime_metadata",
+                    "providerRuntimeMetadata",
+                )
+                or {}
+            ),
             failure_category=_optional_text(
                 config,
                 "failure_category",
@@ -523,6 +552,20 @@ class HermesRegisteredSessionActivationAttempt:
             self.executable_preflight_failure_reason,
             "executablePreflightFailureReason",
         )
+        if self.activation_backend not in {"cli", "tui_gateway"}:
+            raise ValueError("activationBackend must be cli or tui_gateway.")
+        if self.reply_writeback_mode not in {
+            "explicit_only",
+            "provider_final_capture",
+        }:
+            raise ValueError(
+                "replyWritebackMode must be explicit_only or provider_final_capture."
+            )
+        _validate_optional_text(self.runtime_session_id, "runtimeSessionId")
+        _reject_sensitive_config(
+            dict(self.provider_runtime_metadata),
+            "providerRuntimeMetadata",
+        )
         _validate_optional_text(self.failure_category, "failureCategory")
         _validate_text_tuple(self.command_argv_summary, "commandArgvSummary")
         _require_utc_aware(self.created_at, "createdAt")
@@ -530,6 +573,11 @@ class HermesRegisteredSessionActivationAttempt:
             _require_utc_aware(self.completed_at, "completedAt")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "command_argv_summary", tuple(self.command_argv_summary))
+        object.__setattr__(
+            self,
+            "provider_runtime_metadata",
+            dict(self.provider_runtime_metadata),
+        )
 
     def to_metadata(self) -> Mapping[str, object]:
         metadata: dict[str, object] = {
@@ -557,6 +605,9 @@ class HermesRegisteredSessionActivationAttempt:
             "desktopInputInjected": False,
             "browserOrDesktopInputInjected": False,
             "fullSessionHistoryRead": False,
+            "activationBackend": self.activation_backend,
+            "replyWritebackMode": self.reply_writeback_mode,
+            "providerRuntimeMetadata": dict(self.provider_runtime_metadata),
         }
         for key, value in (
             ("ticketPath", self.ticket_path),
@@ -600,6 +651,7 @@ class HermesRegisteredSessionActivationAttempt:
                 "executablePreflightFailureReason",
                 self.executable_preflight_failure_reason,
             ),
+            ("runtimeSessionId", self.runtime_session_id),
             ("failureCategory", self.failure_category),
             ("retryable", self.retryable),
             ("completedAt", self.completed_at.isoformat() if self.completed_at else None),
@@ -634,9 +686,18 @@ class HermesRegisteredSessionActivationAttempt:
         )
         metadata["activationBoundary"] = {
             "schema": "hermes_activation_boundary.v1",
-            "route": "hermes_chat_query_resume",
+            "route": (
+                "hermes_tui_gateway_stdio"
+                if self.activation_backend == "tui_gateway"
+                else "hermes_chat_query_resume"
+            ),
             "desktopSessionTakeover": False,
-            "gatewayOrWebhookActivation": False,
+            "gatewayOrWebhookActivation": self.activation_backend == "tui_gateway",
+            "gatewayLifecycle": (
+                "short_lived_operation_owned_stdio"
+                if self.activation_backend == "tui_gateway"
+                else "not_started"
+            ),
             "mcpOrAcpServerStarted": False,
             "yoloEnabled": False,
             "worktreeEnabled": False,

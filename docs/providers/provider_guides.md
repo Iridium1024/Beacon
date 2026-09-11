@@ -11,6 +11,25 @@ registered-session activation. Ordinary request dispatch usually needs only
 
 - Beacon does not install provider tools, write provider settings, create
   credentials, store tokens, or bypass provider prompts.
+- A normal `agent-dispatch-send` performs one bounded attempt by default. Busy
+  targets return a caller decision; explicit `--queued` remains the advanced
+  worker/daemon path and never auto-starts a daemon. Only Codex currently has a
+  separate active-turn supplement command, and it is offered only for a
+  Beacon-owned steerable runtime.
+- `send`, `queue`, `supplement`, and `status` are provider-neutral meanings.
+  Backend ids such as `codex_app_server_stdio` are selected behind that
+  interface and reported explicitly; backend fallback is never silent. See
+  `../agent/provider_backend_contract.md`.
+- An official upstream SDK, gateway, or server is not automatically a Beacon
+  backend. Only implemented backend ids may be selected or reported as
+  effective. See `provider_programmatic_interfaces.md` for the reviewed Claude,
+  Codex, and Hermes surfaces and their exact-session fit.
+- DeepSeek Harness is different in runtime topology, not in exact-id intent:
+  `agent-join --provider deepseek_harness --session <id>` resumes the exact id
+  from the configured official persistence root, while `--new-session` creates
+  one. It does not provide automatic discovery, reusable provider-session
+  profile import, or foreign live Web/TUI takeover. It is also distinct from
+  the `deepseek` model preset.
 - Default activation keeps provider permission posture unchanged. Claude,
   Codex, and Hermes permission/sandbox/approval/allowed-tools style arguments
   are used only from explicit user-approved profile or CLI input.
@@ -20,13 +39,30 @@ registered-session activation. Ordinary request dispatch usually needs only
 - A provider session handle is a workspace-local Beacon binding to an
   already-approved Claude/Codex/Hermes session. An endpoint alias is the
   workspace-local address used by `agent-dispatch-send --from/--to`.
+- Normal project scope comes from the nearest `.beacon/workspace.json` marker
+  created by `agent-workspace-init`; Beacon does not infer it by scanning local
+  databases.
 - A local provider session profile is a reusable local metadata card for an
   approved provider session. It is not a provider account, login token, or cloud
   identity. Each workspace must be joined explicitly with
   `provider-session-workspace-join`.
-- Prefer `agent-provider-onboard` for normal first-time setup. It creates or
-  reuses the workspace agent, registers or reuses the provider session handle,
-  and logs in or reuses the endpoint alias in one idempotent local workflow.
+- Prefer `agent-join --agent <visible-id> --provider <provider> --session
+  <native-session-id>` for normal first-time setup. It creates or reuses the
+  workspace Agent, exact session handle, and same-named endpoint alias in one
+  idempotent local workflow. `agent-provider-onboard` remains an advanced
+  compatibility interface.
+- Exact join is independent of recent-session display limits, validates the
+  workspace before provider discovery, and does not silently share one active
+  native session between visible Agents in the same workspace.
+- Provider execution does not require or imply a reply. Receivers can choose a
+  response through `agent-reply`; Codex provider-final writeback defaults to
+  `explicit_only` and is opt-in as `provider_final_capture`. Claude CLI keeps
+  historical final capture for compatibility, while opt-in Claude Agent SDK
+  defaults to `explicit_only`. Hermes follows the same compatibility split:
+  `hermes_cli` retains historical capture and opt-in
+  `hermes_tui_gateway_stdio` defaults to `explicit_only`.
+- Under `explicit_only`, the Codex activation text provides the short
+  `agent-reply` command instead of promising automatic final-answer capture.
 - Reusing one native provider session across projects can mix provider-side
   working-directory assumptions, visible conversation state, quota incidents,
   and tool-permission expectations. Beacon keeps the workspace records
@@ -64,12 +100,20 @@ grants, or credentials to address this condition.
 
 - `agent_runtime_preflight.md`: read-only diagnostics for provider executables
   and activation capabilities.
-- `claude_registered_session_activation.md`: Claude Code registered-session
-  activation boundaries.
-- `codex_registered_session_activation.md`: Codex CLI registered-session
-  activation boundaries.
-- `hermes_registered_session_activation.md`: Hermes CLI registered-session
-  activation boundaries.
+- `provider_programmatic_interfaces.md`: current upstream programmatic
+  interfaces, Beacon implementation status, and candidate integration rules.
+- `claude_registered_session_activation.md`: Claude CLI and opt-in Agent SDK
+  registered-session activation, optional install, preflight, writeback, and
+  rollback boundaries.
+- `codex_registered_session_activation.md`: Codex CLI and stable stdio
+  app-server activation, point status, explicit `turn/steer` supplement,
+  configuration, and rollback boundaries.
+- `hermes_registered_session_activation.md`: default Hermes CLI and opt-in,
+  exact-version TUI Gateway registered-session activation boundaries.
+- `deepseek_harness_managed_runtime.md`: exact-version preflight, exact persisted
+  join and new-session onboarding, persistent supervisor/native identity,
+  causal final capture, owned-live status, stop/resume/recreate, and current
+  smoke limits.
 
 ## Provider Notes
 

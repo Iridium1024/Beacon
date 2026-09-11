@@ -4,8 +4,13 @@ Beacon is an alpha-quality local project. A release candidate must pass the
 repository checks without credentials, provider accounts, or live provider
 sessions.
 
-The bilingual public notes for the first alpha release are maintained in
-[v0.1.0.md](v0.1.0.md).
+The first alpha release remains archived in [v0.1.0.md](v0.1.0.md). Historical
+notes not included in this source increment are not release prerequisites.
+
+The pending DSH fourth-Agent source-only increment is documented separately:
+[source installation and optional runtimes](source-installation.md) and the
+[reviewable release-note draft](dsh-source-increment-draft.md). Neither file
+creates a GitHub Release, a tag, or a standalone installer.
 
 ```powershell
 py -3.11 scripts\check_versions.py

@@ -13,14 +13,45 @@ from agent_os import __version__
 from agent_os.application.services.local_platform_application import (
     LocalPlatformApplication,
 )
+from agent_os.application.services.codex_session_control import (
+    CodexControlConfig,
+    resolve_codex_control_config,
+)
+from agent_os.application.services.claude_session_control import (
+    ClaudeControlConfig,
+    resolve_claude_control_config,
+)
+from agent_os.application.services.hermes_session_control import (
+    HermesControlConfig,
+    resolve_hermes_control_config,
+)
+from agent_os.application.services.agent_dispatch_control import (
+    AgentDispatchControlConfig,
+    resolve_agent_dispatch_control_config,
+    resolve_agent_dispatch_delivery_mode,
+)
+from agent_os.application.services.agent_endpoint import (
+    normalize_agent_endpoint_provider,
+)
 from agent_os.application.services.provider_session_profile import (
     ProviderSessionRegistry,
     ProviderSessionRegistryPathResolution,
     provider_session_registry_path_resolution,
     resolve_provider_session_registry_path,
 )
+from agent_os.application.services.project_workspace_scope import (
+    PROJECT_WORKSPACE_MARKER_RELATIVE_PATH,
+    project_workspace_marker_payload,
+    resolve_runtime_profile_from_project_scope,
+    validate_project_workspace_marker_target,
+    write_json_atomic,
+    write_project_workspace_marker_atomic,
+)
 from agent_os.application.services.agent_runtime_preflight import (
     SUPPORTED_AGENT_RUNTIME_TOOLS,
+)
+from agent_os.application.services.deepseek_harness_managed_runtime import (
+    preflight_deepseek_harness_runtime,
 )
 from agent_os.domain.entities.context import ContextUpdateKind
 from agent_os.infrastructure.config import (
@@ -94,6 +125,7 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "agent-endpoint-login",
     "agent-endpoint-login-discovered",
     "agent-endpoint-status",
+    "agent-join",
     "agent-onboarding-status",
     "agent-provider-onboard",
     "provider-session-workspace-join",
@@ -105,6 +137,7 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "agent-exchange-request-policy",
     "agent-exchange-request-policy-update",
     "agent-exchange-request-respond",
+    "agent-reply",
     "agent-exchange-status",
     "agent-exchange-thread-close",
     "agent-exchange-thread-follow-up-create",
@@ -114,6 +147,10 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "agent-exchange-thread-visibility-update",
     "agent-exchange-wake-watch",
     "agent-provider-runtime-status",
+    "deepseek-harness-runtime-status",
+    "deepseek-harness-runtime-stop",
+    "deepseek-harness-runtime-resume",
+    "deepseek-harness-runtime-recreate",
     "agent-runtime-permission-get",
     "agent-runtime-permissions",
     "agent-session-handle-register-discovered",
@@ -127,6 +164,8 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "claude-session-handle-list",
     "claude-session-handle-register",
     "codex-registered-session-activate",
+    "codex-session-status",
+    "codex-session-supplement",
     "codex-session-handle-deactivate",
     "codex-session-handle-get",
     "codex-session-handle-list",
@@ -141,6 +180,7 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "conversation-list",
     "conversation-message-append",
     "conversation-messages",
+    "console-workspace-view",
     "agent-delegated-wake-grant-consume",
     "agent-delegated-wake-grant-create",
     "agent-delegated-wake-grant-revoke",
@@ -160,6 +200,8 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "session-timeline",
     "workspace-archive",
     "workspace-open",
+    "join",
+    "reply",
 }
 
 
@@ -172,13 +214,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _, command = _command_from_argv(raw_argv)
         explicit_profile = _profile_path_from_argv(raw_argv)
-        profile = (
-            {}
-            if command in _NO_RUNTIME_SETTINGS_COMMANDS
-            and explicit_profile is None
-            else _local_runtime_profile(explicit_profile)
-        )
+        resolved_profile_path: str | None = explicit_profile
+        if command in _NO_RUNTIME_SETTINGS_COMMANDS and explicit_profile is None:
+            profile = {}
+        elif command in {"agent-workspace-init", "local-runtime-profile-init"}:
+            profile = _local_runtime_profile(explicit_profile)
+        else:
+            (
+                resolved_profile_path,
+                project_scope,
+                _,
+            ) = resolve_runtime_profile_from_project_scope(
+                explicit_profile_path=explicit_profile,
+                environment_profile_path=os.environ.get(
+                    "AGENT_OS_LOCAL_RUNTIME_PROFILE"
+                ),
+            )
+            profile = _local_runtime_profile(resolved_profile_path)
+            if project_scope is not None:
+                profile_workspace_id = _workspace_id_from_profile(profile)
+                if profile_workspace_id != project_scope.workspace_id:
+                    raise ValueError(
+                        "workspace_scope_conflict: nearest project marker "
+                        f"workspaceId={project_scope.workspace_id} does not match "
+                        "the selected profile workspaceId="
+                        f"{profile_workspace_id or '<missing>'}."
+                    )
         args = parser.parse_args(_argv_with_workspace_id_default(raw_argv, profile))
+        if resolved_profile_path is not None and args.profile is None:
+            args.profile = resolved_profile_path
         _apply_workspace_id_default(args, profile)
         if args.command == "agent-help":
             result = _agent_help(args.topic)
@@ -340,6 +404,15 @@ def _build_parser() -> argparse.ArgumentParser:
     workspace_init.add_argument("--base-directory")
     workspace_init.add_argument("--profile-path")
     workspace_init.add_argument(
+        "--existing-database",
+        help=(
+            "Explicitly adopt an existing Beacon database without scanning, "
+            "copying, or creating a parallel workspace database."
+        ),
+    )
+    workspace_init.add_argument("--existing-workspace-root")
+    workspace_init.add_argument("--existing-plugins-directory")
+    workspace_init.add_argument(
         "--pretty",
         action="store_true",
         default=argparse.SUPPRESS,
@@ -366,6 +439,13 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--root-path")
 
     subparsers.add_parser("workspace-list")
+
+    subparsers.add_parser("console-workspace-list")
+    subparsers.add_parser("console-provider-backends")
+    console_workspace = subparsers.add_parser("console-workspace-view")
+    console_workspace.add_argument("--workspace-id", required=True)
+    console_workspace.add_argument("--cursor")
+    console_workspace.add_argument("--limit", type=int, default=50)
 
     open_workspace = subparsers.add_parser("workspace-open")
     open_workspace.add_argument("--workspace-id", required=True)
@@ -542,13 +622,23 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_create.add_argument("--metadata", action="append", default=[])
     dispatch_create.add_argument("--dry-run", action="store_true")
 
-    dispatch_send = subparsers.add_parser("agent-dispatch-send")
+    dispatch_send = subparsers.add_parser(
+        "agent-dispatch-send",
+        help=(
+            "Send one bounded inline request by default; use --queued only "
+            "with a confirmed worker or daemon."
+        ),
+    )
     dispatch_send.add_argument("--workspace-id", required=True)
     dispatch_send.add_argument("--dispatch-id")
     dispatch_send.add_argument("--exchange-request-id")
     dispatch_send.add_argument("--from", "--from-endpoint", dest="from_endpoint_alias")
-    dispatch_send.add_argument("--as", dest="acting_endpoint_alias")
-    dispatch_send.add_argument("--to", "--to-endpoint", dest="to_endpoint_alias")
+    dispatch_send.add_argument(
+        "--as", "--from-agent", dest="acting_endpoint_alias"
+    )
+    dispatch_send.add_argument(
+        "--to", "--to-endpoint", "--to-agent", dest="to_endpoint_alias"
+    )
     dispatch_send.add_argument("--source-agent-id")
     dispatch_send.add_argument("--target-agent-id")
     dispatch_send.add_argument("--source-handle-id")
@@ -578,9 +668,25 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_send.add_argument(
         "--delivery-mode",
         choices=("queued", "worker_dry_run", "worker_execute"),
+        help=(
+            "Compatibility/internal mode: worker_execute=send inline, "
+            "queued=queue, worker_dry_run=preview."
+        ),
     )
-    dispatch_send.add_argument("--wait", choices=("once",))
-    dispatch_send.add_argument("--queued", action="store_true")
+    dispatch_send.add_argument(
+        "--wait",
+        choices=("once",),
+        help="Compatibility spelling for the default bounded inline send.",
+    )
+    dispatch_send.add_argument(
+        "--queued",
+        action="store_true",
+        help="Queue only; does not start a provider, worker, or daemon.",
+    )
+    dispatch_send.add_argument(
+        "--immediate-busy-policy",
+        choices=("return_to_sender", "queue_next_turn"),
+    )
     dispatch_send.add_argument("--dispatcher-id", default="agent-dispatch-worker")
     dispatch_send.add_argument("--lease-ttl-seconds", type=int, default=300)
     dispatch_send.add_argument("--retry-delay-seconds", type=int, default=300)
@@ -602,6 +708,16 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_send.add_argument("--claude-permission-mode")
     dispatch_send.add_argument("--claude-settings-path")
     dispatch_send.add_argument(
+        "--claude-activation-backend",
+        choices=("cli", "agent_sdk"),
+        help="Select default CLI rollback or the opt-in short-lived Agent SDK.",
+    )
+    dispatch_send.add_argument(
+        "--claude-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+        help="Choose receiver-explicit reply or automatic verified final capture.",
+    )
+    dispatch_send.add_argument(
         "--codex-executable",
         "--codex-path",
         dest="codex_executable",
@@ -619,12 +735,38 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("skip", "strict"),
     )
     dispatch_send.add_argument(
+        "--codex-activation-backend",
+        choices=("exec_resume", "app_server"),
+    )
+    dispatch_send.add_argument(
+        "--codex-app-server-approval-decision",
+        choices=("decline", "cancel", "accept", "accept_for_session"),
+    )
+    dispatch_send.add_argument(
+        "--codex-busy-delivery-policy",
+        choices=("queue_next_turn", "reject"),
+    )
+    dispatch_send.add_argument(
+        "--codex-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_send.add_argument(
         "--hermes-executable",
         "--hermes-path",
         dest="hermes_executable",
         default="hermes",
     )
     dispatch_send.add_argument("--hermes-home")
+    dispatch_send.add_argument(
+        "--hermes-activation-backend",
+        choices=("cli", "tui_gateway"),
+        help="Select default CLI rollback or the opt-in short-lived TUI gateway.",
+    )
+    dispatch_send.add_argument(
+        "--hermes-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_send.add_argument("--hermes-gateway-python")
     dispatch_send.add_argument("--hermes-source-tag", default="agent-os")
     dispatch_send.add_argument("--hermes-max-turns", type=int)
     dispatch_send.add_argument("--activation-timeout-seconds", type=int, default=120)
@@ -647,6 +789,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "cancelled",
             "failed",
             "completed",
+            "terminal_unprocessed",
         ),
     )
     dispatch_list.add_argument("--limit", type=int, default=20)
@@ -737,6 +880,16 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_worker.add_argument("--claude-permission-mode")
     dispatch_worker.add_argument("--claude-settings-path")
     dispatch_worker.add_argument(
+        "--claude-activation-backend",
+        choices=("cli", "agent_sdk"),
+        help="Select default CLI rollback or the opt-in short-lived Agent SDK.",
+    )
+    dispatch_worker.add_argument(
+        "--claude-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+        help="Choose receiver-explicit reply or automatic verified final capture.",
+    )
+    dispatch_worker.add_argument(
         "--codex-executable",
         "--codex-path",
         dest="codex_executable",
@@ -754,12 +907,38 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("skip", "strict"),
     )
     dispatch_worker.add_argument(
+        "--codex-activation-backend",
+        choices=("exec_resume", "app_server"),
+    )
+    dispatch_worker.add_argument(
+        "--codex-app-server-approval-decision",
+        choices=("decline", "cancel", "accept", "accept_for_session"),
+    )
+    dispatch_worker.add_argument(
+        "--codex-busy-delivery-policy",
+        choices=("queue_next_turn", "reject"),
+    )
+    dispatch_worker.add_argument(
+        "--codex-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_worker.add_argument(
         "--hermes-executable",
         "--hermes-path",
         dest="hermes_executable",
         default="hermes",
     )
     dispatch_worker.add_argument("--hermes-home")
+    dispatch_worker.add_argument(
+        "--hermes-activation-backend",
+        choices=("cli", "tui_gateway"),
+        help="Select default CLI rollback or the opt-in short-lived TUI gateway.",
+    )
+    dispatch_worker.add_argument(
+        "--hermes-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_worker.add_argument("--hermes-gateway-python")
     dispatch_worker.add_argument("--hermes-source-tag", default="agent-os")
     dispatch_worker.add_argument("--hermes-max-turns", type=int)
     dispatch_worker.add_argument("--activation-timeout-seconds", type=int, default=120)
@@ -805,6 +984,16 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_daemon_start.add_argument("--claude-permission-mode")
     dispatch_daemon_start.add_argument("--claude-settings-path")
     dispatch_daemon_start.add_argument(
+        "--claude-activation-backend",
+        choices=("cli", "agent_sdk"),
+        help="Select default CLI rollback or the opt-in short-lived Agent SDK.",
+    )
+    dispatch_daemon_start.add_argument(
+        "--claude-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+        help="Choose receiver-explicit reply or automatic verified final capture.",
+    )
+    dispatch_daemon_start.add_argument(
         "--codex-executable",
         "--codex-path",
         dest="codex_executable",
@@ -822,12 +1011,37 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("skip", "strict"),
     )
     dispatch_daemon_start.add_argument(
+        "--codex-activation-backend",
+        choices=("exec_resume", "app_server"),
+    )
+    dispatch_daemon_start.add_argument(
+        "--codex-app-server-approval-decision",
+        choices=("decline", "cancel", "accept", "accept_for_session"),
+    )
+    dispatch_daemon_start.add_argument(
+        "--codex-busy-delivery-policy",
+        choices=("queue_next_turn", "reject"),
+    )
+    dispatch_daemon_start.add_argument(
+        "--codex-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_daemon_start.add_argument(
         "--hermes-executable",
         "--hermes-path",
         dest="hermes_executable",
         default="hermes",
     )
     dispatch_daemon_start.add_argument("--hermes-home")
+    dispatch_daemon_start.add_argument(
+        "--hermes-activation-backend",
+        choices=("cli", "tui_gateway"),
+    )
+    dispatch_daemon_start.add_argument(
+        "--hermes-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    dispatch_daemon_start.add_argument("--hermes-gateway-python")
     dispatch_daemon_start.add_argument("--hermes-source-tag", default="agent-os")
     dispatch_daemon_start.add_argument("--hermes-max-turns", type=int)
     dispatch_daemon_start.add_argument(
@@ -1095,7 +1309,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     onboarding_status.add_argument(
         "--provider",
-        choices=("claude", "claude-cli", "claude-code", "codex", "codex-cli", "hermes", "hermes-cli", "hermes-desktop"),
+        choices=("claude", "claude-cli", "claude-code", "codex", "codex-cli", "hermes", "hermes-cli", "hermes-desktop", "deepseek_harness", "deepseek-harness", "dsh"),
+    )
+    onboarding_status.add_argument(
+        "--native-session-id",
+        help="Exact ID in the workspace's registered handle inventory; no external discovery or runtime start.",
     )
     _add_runtime_status_policy_arguments(onboarding_status)
     onboarding_status.add_argument("--format", choices=("json", "pretty"), default="json")
@@ -1198,6 +1416,15 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_onboard.add_argument("--reason", default="agent provider onboard")
     provider_onboard.add_argument("--metadata-json")
     provider_onboard.add_argument("--no-reuse-existing", action="store_true")
+    provider_onboard.add_argument(
+        "--allow-shared-session-binding",
+        action="store_true",
+        help=(
+            "Advanced compatibility override: allow the same provider-native "
+            "session to be bound to another visible Agent. Ordinary agent-join "
+            "continues to reject this ambiguous ownership."
+        ),
+    )
     provider_onboard.add_argument("--dry-run", action="store_true")
     provider_onboard.add_argument("--format", choices=("json",), default="json")
     provider_onboard.add_argument("--allow-source-alias", action="append", default=[])
@@ -1229,6 +1456,133 @@ def _build_parser() -> argparse.ArgumentParser:
     provider_onboard.add_argument("--snippet-turn-index", type=int)
     provider_onboard.add_argument("--snippet-max-chars", type=int, default=160)
 
+    agent_join = subparsers.add_parser(
+        "agent-join",
+        aliases=("join",),
+        help=(
+            "Join this project workspace with a visible Agent id, provider, "
+            "and exact native session id."
+        ),
+    )
+    agent_join.add_argument("--workspace-id", required=True)
+    agent_join.add_argument("--agent", "--agent-id", dest="agent_id", required=True)
+    agent_join.add_argument(
+        "--provider",
+        choices=("claude", "codex", "hermes", "deepseek_harness", "dsh"),
+        required=True,
+    )
+    agent_join_session = agent_join.add_mutually_exclusive_group(required=True)
+    agent_join_session.add_argument("--session", "--session-id", dest="session_id")
+    agent_join_session.add_argument(
+        "--new-session",
+        action="store_true",
+        help="Create a new Beacon-owned DeepSeek Harness session/runtime generation.",
+    )
+    agent_join.add_argument("--name", dest="agent_name")
+    agent_join.add_argument("--created-by", default="agent")
+    agent_join.add_argument("--reason", default="agent join")
+    agent_join.add_argument("--metadata-json")
+    agent_join.add_argument("--no-reuse-existing", action="store_true")
+    agent_join.add_argument("--dry-run", action="store_true")
+    agent_join.add_argument("--limit", type=int, default=100)
+    agent_join.add_argument("--cwd")
+    agent_join.add_argument("--claude-home")
+    agent_join.add_argument("--codex-home")
+    agent_join.add_argument("--hermes-home")
+    agent_join.add_argument(
+        "--hermes-executable",
+        "--hermes-path",
+        dest="hermes_executable",
+        default="hermes",
+    )
+    agent_join.add_argument("--hermes-source")
+    agent_join.add_argument("--hermes-timeout-seconds", type=float, default=15.0)
+    agent_join.add_argument("--dsh-carrier", choices=("node", "python"))
+    agent_join.add_argument("--dsh-executable", "--deepseek-harness-executable")
+    agent_join.add_argument("--dsh-package-root", "--deepseek-harness-package-root")
+    agent_join.add_argument("--dsh-cordis-config")
+    agent_join.add_argument("--dsh-runtime-home")
+    agent_join.add_argument("--dsh-state-root")
+    agent_join.add_argument("--dsh-session-root")
+    agent_join.add_argument(
+        "--dsh-session-compression",
+        choices=("zstd", "none"),
+    )
+    agent_join.add_argument("--dsh-model-provider")
+    agent_join.add_argument("--dsh-model")
+    agent_join.add_argument(
+        "--dsh-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    agent_join.add_argument("--dsh-initialize-timeout-seconds", type=float)
+    agent_join.add_argument("--dsh-operation-timeout-seconds", type=float)
+    agent_join.add_argument("--dsh-shutdown-timeout-seconds", type=float)
+
+    dsh_preflight = subparsers.add_parser("deepseek-harness-runtime-preflight")
+    dsh_preflight.add_argument("--dsh-carrier", choices=("node", "python"))
+    dsh_preflight.add_argument("--dsh-executable", "--deepseek-harness-executable")
+    dsh_preflight.add_argument("--dsh-package-root", "--deepseek-harness-package-root")
+    dsh_preflight.add_argument("--dsh-cordis-config")
+    dsh_preflight.add_argument("--dsh-session-root")
+    dsh_preflight.add_argument("--session", dest="session_id")
+    dsh_preflight.add_argument(
+        "--dsh-session-compression",
+        choices=("zstd", "none"),
+    )
+
+    dsh_status = subparsers.add_parser("deepseek-harness-runtime-status")
+    dsh_status.add_argument("--workspace-id", required=True)
+    dsh_status.add_argument("--handle-id", required=True)
+
+    dsh_stop = subparsers.add_parser("deepseek-harness-runtime-stop")
+    dsh_stop.add_argument("--workspace-id", required=True)
+    dsh_stop.add_argument("--handle-id", required=True)
+    dsh_stop.add_argument("--stopped-by", default="user")
+    dsh_stop.add_argument(
+        "--acknowledge-runtime-stop",
+        "--acknowledge-continuity-loss",
+        dest="acknowledge_runtime_stop",
+        action="store_true",
+        required=True,
+    )
+
+    dsh_resume = subparsers.add_parser("deepseek-harness-runtime-resume")
+    dsh_resume.add_argument("--workspace-id", required=True)
+    dsh_resume.add_argument("--handle-id", required=True)
+    dsh_resume.add_argument("--resumed-by", default="user")
+    dsh_resume.add_argument(
+        "--acknowledge-ambiguous-delivery",
+        action="store_true",
+    )
+
+    dsh_recreate = subparsers.add_parser("deepseek-harness-runtime-recreate")
+    dsh_recreate.add_argument("--workspace-id", required=True)
+    dsh_recreate.add_argument("--handle-id", required=True)
+    dsh_recreate.add_argument("--recreated-by", default="user")
+    dsh_recreate.add_argument(
+        "--acknowledge-continuity-loss",
+        action="store_true",
+        required=True,
+    )
+
+    agent_reply = subparsers.add_parser(
+        "agent-reply",
+        aliases=("reply",),
+        help="Write one explicit Beacon reply for an active exchange request.",
+    )
+    agent_reply.add_argument("--workspace-id", required=True)
+    agent_reply.add_argument(
+        "--request", "--exchange-request-id", dest="exchange_request_id", required=True
+    )
+    agent_reply.add_argument(
+        "--agent", "--responding-agent-id", dest="responding_agent_id", required=True
+    )
+    agent_reply.add_argument(
+        "--message", "--response-summary", dest="response_summary", required=True
+    )
+    agent_reply.add_argument("--requires-user-review", action="store_true")
+    agent_reply.add_argument("--metadata-json")
+
     endpoint_login = subparsers.add_parser("agent-endpoint-login")
     endpoint_login.add_argument("--workspace-id", required=True)
     endpoint_login.add_argument("--agent-id", required=True)
@@ -1236,7 +1590,7 @@ def _build_parser() -> argparse.ArgumentParser:
     endpoint_login.add_argument("--alias", required=True)
     endpoint_login.add_argument(
         "--provider",
-        choices=("claude", "claude-cli", "claude-code", "codex", "codex-cli", "hermes", "hermes-cli", "hermes-desktop"),
+        choices=("claude", "claude-cli", "claude-code", "codex", "codex-cli", "hermes", "hermes-cli", "hermes-desktop", "deepseek_harness", "deepseek-harness", "dsh"),
         required=True,
     )
     endpoint_login.add_argument("--provider-handle-id", required=True)
@@ -1270,7 +1624,7 @@ def _build_parser() -> argparse.ArgumentParser:
     endpoint_list.add_argument("--agent-id")
     endpoint_list.add_argument(
         "--provider",
-        choices=("claude", "codex", "hermes"),
+        choices=("claude", "codex", "hermes", "deepseek_harness"),
     )
     endpoint_list.add_argument("--include-inactive", action="store_true")
 
@@ -1351,6 +1705,16 @@ def _build_parser() -> argparse.ArgumentParser:
     claude_activate.add_argument("--allowed-tool", action="append", default=[])
     claude_activate.add_argument("--permission-mode")
     claude_activate.add_argument("--settings-path")
+    claude_activate.add_argument(
+        "--claude-activation-backend",
+        choices=("cli", "agent_sdk"),
+        help="Select default CLI rollback or the opt-in short-lived Agent SDK.",
+    )
+    claude_activate.add_argument(
+        "--claude-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+        help="Choose receiver-explicit reply or automatic verified final capture.",
+    )
     claude_activate.add_argument("--timeout-seconds", type=int, default=120)
     claude_activate.add_argument("--dry-run", action="store_true")
     claude_activate.add_argument("--execute", action="store_true")
@@ -1407,9 +1771,62 @@ def _build_parser() -> argparse.ArgumentParser:
         "--codex-git-repo-check-policy",
         choices=("skip", "strict"),
     )
+    codex_activate.add_argument(
+        "--activation-backend",
+        "--codex-activation-backend",
+        dest="codex_activation_backend",
+        choices=("exec_resume", "app_server"),
+    )
+    codex_activate.add_argument(
+        "--app-server-approval-decision",
+        "--codex-app-server-approval-decision",
+        dest="codex_app_server_approval_decision",
+        choices=("decline", "cancel", "accept", "accept_for_session"),
+    )
+    codex_activate.add_argument(
+        "--reply-writeback-mode",
+        "--codex-reply-writeback-mode",
+        dest="codex_reply_writeback_mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
     codex_activate.add_argument("--timeout-seconds", type=int, default=120)
     codex_activate.add_argument("--dry-run", action="store_true")
     codex_activate.add_argument("--execute", action="store_true")
+
+    codex_status = subparsers.add_parser("codex-session-status")
+    codex_status.add_argument("--workspace-id", required=True)
+    codex_status.add_argument("--agent-id", required=True)
+    codex_status.add_argument("--handle-id", required=True)
+    codex_status.add_argument(
+        "--status-read-mode",
+        "--codex-status-read-mode",
+        dest="codex_status_read_mode",
+        choices=("beacon_snapshot", "app_server_point_read"),
+    )
+    codex_status.add_argument(
+        "--codex-executable",
+        "--codex-path",
+        dest="codex_executable",
+        default="codex",
+    )
+    codex_status.add_argument("--point-read-timeout-seconds", type=int, default=20)
+
+    codex_supplement = subparsers.add_parser("codex-session-supplement")
+    codex_supplement.add_argument("--workspace-id", required=True)
+    codex_supplement.add_argument("--agent-id", required=True)
+    codex_supplement.add_argument("--handle-id", required=True)
+    codex_supplement.add_argument("--message", required=True)
+    codex_supplement.add_argument("--expected-turn-id", required=True)
+    codex_supplement.add_argument("--submitted-by", required=True)
+    codex_supplement.add_argument("--supplement-id")
+    codex_supplement.add_argument(
+        "--supplement-mode",
+        "--codex-supplement-mode",
+        dest="codex_supplement_mode",
+        choices=("turn_steer", "disabled"),
+    )
+    codex_supplement.add_argument("--wait", choices=("once",))
+    codex_supplement.add_argument("--wait-timeout-seconds", type=float, default=5.0)
 
     hermes_handle_register = subparsers.add_parser("hermes-session-handle-register")
     hermes_handle_register.add_argument("--workspace-id", required=True)
@@ -1455,6 +1872,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     hermes_activate.add_argument("--platform-workspace-root")
     hermes_activate.add_argument("--hermes-home")
+    hermes_activate.add_argument(
+        "--hermes-activation-backend",
+        choices=("cli", "tui_gateway"),
+        help="Select default CLI rollback or the opt-in short-lived TUI gateway.",
+    )
+    hermes_activate.add_argument(
+        "--hermes-reply-writeback-mode",
+        choices=("explicit_only", "provider_final_capture"),
+    )
+    hermes_activate.add_argument("--hermes-gateway-python")
     hermes_activate.add_argument("--source-tag", default="agent-os")
     hermes_activate.add_argument("--max-turns", type=int)
     hermes_activate.add_argument("--timeout-seconds", type=int, default=120)
@@ -1828,10 +2255,54 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
         workspace_id,
         args.profile_path,
     )
+    marker_path = (
+        project_root / PROJECT_WORKSPACE_MARKER_RELATIVE_PATH
+    ).resolve(strict=False)
+    validate_project_workspace_marker_target(
+        marker_path,
+        workspace_id=workspace_id,
+        profile_path=profile_path,
+    )
+    if profile_path.exists():
+        existing_profile = _local_runtime_profile(str(profile_path))
+        existing_workspace_id = _workspace_id_from_profile(existing_profile)
+        if existing_workspace_id != workspace_id:
+            raise ValueError(
+                "workspace_scope_conflict: existing profile is bound to "
+                f"workspaceId={existing_workspace_id or '<missing>'}."
+            )
 
-    database_path = workspace_base / "platform.sqlite3"
-    workspace_root = workspace_base / "workspace-root"
-    plugins_directory = workspace_base / "plugins"
+    existing_database = getattr(args, "existing_database", None)
+    existing_workspace_root = getattr(args, "existing_workspace_root", None)
+    existing_plugins_directory = getattr(args, "existing_plugins_directory", None)
+    if existing_database is None and (
+        existing_workspace_root is not None
+        or existing_plugins_directory is not None
+    ):
+        raise ValueError(
+            "existingDatabase is required when adopting existing workspace paths."
+        )
+    existing_workspace_adopted = existing_database is not None
+    if existing_workspace_adopted:
+        database_path = _resolved_path(existing_database, "existingDatabase")
+        if not database_path.is_file():
+            raise ValueError(
+                f"existingDatabase must identify an existing file: {database_path}"
+            )
+        workspace_root = (
+            _resolved_path(existing_workspace_root, "existingWorkspaceRoot")
+            if existing_workspace_root is not None
+            else (database_path.parent / "workspace-root").resolve(strict=False)
+        )
+        plugins_directory = (
+            _resolved_path(existing_plugins_directory, "existingPluginsDirectory")
+            if existing_plugins_directory is not None
+            else (database_path.parent / "plugins").resolve(strict=False)
+        )
+    else:
+        database_path = workspace_base / "platform.sqlite3"
+        workspace_root = workspace_base / "workspace-root"
+        plugins_directory = workspace_base / "plugins"
     wake_tickets_directory = workspace_base / "wake-tickets"
     dispatch_state_directory = workspace_base / "dispatch-state"
     output_directory = workspace_base / "output"
@@ -1857,23 +2328,32 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
         database=str(database_path),
         workspace_root=str(workspace_root),
         plugins_directory=str(plugins_directory),
+        initialize_schema=not existing_workspace_adopted,
     )
     application = LocalPlatformApplication(settings)
-    workspace_created = True
-    try:
-        workspace = application.create_workspace(
-            workspace_id=workspace_id,
-            display_name=_non_empty_text(args.display_name, "displayName"),
-            root_path=str(workspace_root),
-        )
-    except ValueError as exc:
-        if "workspace state already exists" not in str(exc):
-            raise
+    if existing_workspace_adopted:
         workspace_created = False
         workspace = {
             "workspace": application.open_workspace(workspace_id),
             "created": False,
+            "adopted": True,
         }
+    else:
+        workspace_created = True
+        try:
+            workspace = application.create_workspace(
+                workspace_id=workspace_id,
+                display_name=_non_empty_text(args.display_name, "displayName"),
+                root_path=str(workspace_root),
+            )
+        except ValueError as exc:
+            if "workspace state already exists" not in str(exc):
+                raise
+            workspace_created = False
+            workspace = {
+                "workspace": application.open_workspace(workspace_id),
+                "created": False,
+            }
 
     local_absolute_paths = {
         "projectRoot": str(project_root),
@@ -1887,6 +2367,7 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
         "outputDirectory": str(output_directory),
         "profilePath": str(profile_path),
         "providerSessionRegistry": str(provider_session_registry),
+        "projectWorkspaceMarker": str(marker_path),
     }
     project_relative_paths = {
         key: _relative_path_text(project_root, Path(value))
@@ -1912,6 +2393,26 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
             "providerSessionRegistryPathSourceKey": (
                 registry_resolution.registry_path_source_key
             ),
+            "claudeControl": {
+                "activationBackend": "cli",
+            },
+            "codexControl": {
+                "activationBackend": "exec_resume",
+                "statusReadMode": "beacon_snapshot",
+                "supplementMode": "turn_steer",
+                "replyWritebackMode": "explicit_only",
+            },
+            "deepseekHarnessControl": {
+                "enabled": False,
+                "activationBackend": "managed_runtime",
+                "replyWritebackMode": "explicit_only",
+                "existingSessionImport": True,
+                "coldResume": True,
+            },
+            "dispatchControl": {
+                "defaultDeliveryMode": "worker_execute",
+                "immediateBusyPolicy": "return_to_sender",
+            },
         },
         "pathPolicy": {
             "localAbsolutePaths": local_absolute_paths,
@@ -1924,15 +2425,26 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
             ),
         },
     }
-    profile_path.write_text(
-        json.dumps(profile_payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    write_json_atomic(profile_path, profile_payload)
+    marker_payload = project_workspace_marker_payload(
+        project_root=project_root,
+        workspace_id=workspace_id,
+        profile_path=profile_path,
+    )
+    write_project_workspace_marker_atomic(
+        marker_path,
+        workspace_id=workspace_id,
+        profile_path=profile_path,
+        payload=marker_payload,
     )
 
     return {
         "schema": "agent_workspace_init.v1",
         "initialized": True,
         "workspaceCreated": workspace_created,
+        "existingWorkspaceAdopted": existing_workspace_adopted,
+        "databaseCopied": False,
+        "databaseScanned": False,
         "workspaceId": workspace_id,
         "displayName": _non_empty_text(args.display_name, "displayName"),
         "workspace": workspace,
@@ -1943,6 +2455,13 @@ def _initialize_agent_workspace(args: argparse.Namespace) -> Mapping[str, object
             "environment": {
                 "AGENT_OS_LOCAL_RUNTIME_PROFILE": str(profile_path),
             },
+        },
+        "projectWorkspaceScope": {
+            "markerPath": str(marker_path),
+            "workspaceId": workspace_id,
+            "profilePath": str(profile_path),
+            "profileSource": "nearest_project_marker",
+            "databaseScanned": False,
         },
         "paths": {
             "localAbsolutePaths": local_absolute_paths,
@@ -2200,6 +2719,16 @@ def _agent_dispatch_daemon_argv(
         _append_argv_option(argv, "--claude-allowed-tool", value)
     _append_argv_option(argv, "--claude-permission-mode", args.claude_permission_mode)
     _append_argv_option(argv, "--claude-settings-path", args.claude_settings_path)
+    _append_argv_option(
+        argv,
+        "--claude-activation-backend",
+        args.claude_activation_backend,
+    )
+    _append_argv_option(
+        argv,
+        "--claude-reply-writeback-mode",
+        args.claude_reply_writeback_mode,
+    )
     _append_argv_option(argv, "--codex-executable", args.codex_executable)
     if args.no_codex_default_platform_workspace_add_dir:
         argv.append("--no-codex-default-platform-workspace-add-dir")
@@ -2212,8 +2741,39 @@ def _agent_dispatch_daemon_argv(
         "--codex-git-repo-check-policy",
         args.codex_git_repo_check_policy,
     )
+    _append_argv_option(
+        argv,
+        "--codex-activation-backend",
+        args.codex_activation_backend,
+    )
+    _append_argv_option(
+        argv,
+        "--codex-app-server-approval-decision",
+        args.codex_app_server_approval_decision,
+    )
+    _append_argv_option(
+        argv,
+        "--codex-busy-delivery-policy",
+        args.codex_busy_delivery_policy,
+    )
+    _append_argv_option(
+        argv,
+        "--codex-reply-writeback-mode",
+        args.codex_reply_writeback_mode,
+    )
     _append_argv_option(argv, "--hermes-executable", args.hermes_executable)
     _append_argv_option(argv, "--hermes-home", args.hermes_home)
+    _append_argv_option(
+        argv,
+        "--hermes-activation-backend",
+        args.hermes_activation_backend,
+    )
+    _append_argv_option(
+        argv,
+        "--hermes-reply-writeback-mode",
+        args.hermes_reply_writeback_mode,
+    )
+    _append_argv_option(argv, "--hermes-gateway-python", args.hermes_gateway_python)
     _append_argv_option(argv, "--hermes-source-tag", args.hermes_source_tag)
     _append_argv_option(argv, "--hermes-max-turns", args.hermes_max_turns)
     _append_argv_option(
@@ -2280,6 +2840,129 @@ def _local_runtime_profile(profile_path: str | None) -> Mapping[str, object]:
     return raw_profile
 
 
+def _deepseek_harness_control_config(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+    *,
+    settings: LocalPlatformSettings,
+    require_runtime_paths: bool,
+) -> Mapping[str, object]:
+    raw = profile.get("deepseekHarnessControl", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("localRuntime.deepseekHarnessControl must be a JSON object.")
+
+    def selected(argument: str, key: str, default: object = None) -> object:
+        explicit = getattr(args, argument, None)
+        if explicit is not None:
+            return explicit
+        return raw.get(key, default)
+
+    carrier = selected("dsh_carrier", "carrier")
+    executable = selected("dsh_executable", "executablePath")
+    package_root = selected("dsh_package_root", "packageRoot")
+    cordis = selected("dsh_cordis_config", "cordisConfigPath")
+    if require_runtime_paths:
+        for field_name, value in (
+            ("carrier", carrier),
+            ("executablePath", executable),
+            ("packageRoot", package_root),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"localRuntime.deepseekHarnessControl.{field_name} is required."
+                )
+    package_path = (
+        Path(str(package_root)).expanduser().resolve(strict=False)
+        if package_root is not None
+        else None
+    )
+    local_root = (
+        Path(settings.workspace_root).expanduser().resolve(strict=False).parent
+        / "deepseek-harness-managed-runtimes"
+    )
+    runtime_home = selected(
+        "dsh_runtime_home",
+        "runtimeHome",
+        str(package_path / ".dsh-home") if package_path is not None else None,
+    )
+    state_root = selected("dsh_state_root", "stateRoot", str(local_root / "state"))
+    session_root = selected(
+        "dsh_session_root",
+        "sessionRoot",
+        str(local_root / "sessions" / str(getattr(args, "agent_id", "new-agent"))),
+    )
+    session_compression = selected(
+        "dsh_session_compression",
+        "sessionCompression",
+        "zstd",
+    )
+    if session_compression not in {"zstd", "none"}:
+        raise ValueError(
+            "deepseekHarnessControl.sessionCompression must be zstd or none."
+        )
+    model_provider = selected("dsh_model_provider", "modelProvider")
+    model = selected("dsh_model", "model")
+    if require_runtime_paths:
+        for field_name, value in (
+            ("runtimeHome", runtime_home),
+            ("stateRoot", state_root),
+            ("sessionRoot", session_root),
+            ("modelProvider", model_provider),
+            ("model", model),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"localRuntime.deepseekHarnessControl.{field_name} is required."
+                )
+    reply_mode = selected(
+        "dsh_reply_writeback_mode",
+        "replyWritebackMode",
+        "explicit_only",
+    )
+    if reply_mode not in {"explicit_only", "provider_final_capture"}:
+        raise ValueError(
+            "deepseekHarnessControl.replyWritebackMode must be explicit_only or "
+            "provider_final_capture."
+        )
+    return {
+        "schema": "deepseek_harness_control.v1",
+        "enabled": bool(raw.get("enabled", False)),
+        "activationBackend": "managed_runtime",
+        "carrier": carrier,
+        "executablePath": executable,
+        "packageRoot": package_root,
+        "cordisConfigPath": cordis,
+        "runtimeHome": runtime_home,
+        "runtimeHomeSource": (
+            "explicit_cli"
+            if getattr(args, "dsh_runtime_home", None) is not None
+            else "localRuntime.deepseekHarnessControl"
+        ),
+        "stateRoot": state_root,
+        "sessionRoot": session_root,
+        "sessionCompression": session_compression,
+        "modelProvider": model_provider,
+        "model": model,
+        "replyWritebackMode": reply_mode,
+        "initializeTimeoutSeconds": float(
+            selected("dsh_initialize_timeout_seconds", "initializeTimeoutSeconds", 30.0)
+        ),
+        "operationTimeoutSeconds": float(
+            selected("dsh_operation_timeout_seconds", "operationTimeoutSeconds", 120.0)
+        ),
+        "shutdownTimeoutSeconds": float(
+            selected("dsh_shutdown_timeout_seconds", "shutdownTimeoutSeconds", 5.0)
+        ),
+        "maxLineBytes": int(raw.get("maxLineBytes", 1024 * 1024)),
+        "maxTotalOutputBytes": int(raw.get("maxTotalOutputBytes", 32 * 1024 * 1024)),
+        "maxStderrBytes": int(raw.get("maxStderrBytes", 64 * 1024)),
+        "existingSessionImport": True,
+        "coldResume": True,
+    }
+
+
 def _codex_git_repo_check_policy(
     args: argparse.Namespace,
     profile: Mapping[str, object],
@@ -2297,6 +2980,89 @@ def _codex_git_repo_check_policy(
 def _validated_codex_git_repo_check_policy(value: object) -> str:
     if not isinstance(value, str) or value.strip() not in {"skip", "strict"}:
         raise ValueError("codexGitRepoCheckPolicy must be 'skip' or 'strict'.")
+    return value.strip()
+
+
+def _codex_activation_backend(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> tuple[str, str]:
+    selection = _codex_control_config(args, profile).activation_backend
+    return selection.value, selection.source
+
+
+def _codex_control_config(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> CodexControlConfig:
+    return resolve_codex_control_config(
+        profile,
+        activation_backend=getattr(args, "codex_activation_backend", None),
+        status_read_mode=getattr(args, "codex_status_read_mode", None),
+        supplement_mode=getattr(args, "codex_supplement_mode", None),
+        busy_delivery_policy=getattr(args, "codex_busy_delivery_policy", None),
+        reply_writeback_mode=getattr(args, "codex_reply_writeback_mode", None),
+    )
+
+
+def _claude_control_config(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> ClaudeControlConfig:
+    return resolve_claude_control_config(
+        profile,
+        activation_backend=getattr(args, "claude_activation_backend", None),
+        reply_writeback_mode=getattr(args, "claude_reply_writeback_mode", None),
+    )
+
+
+def _hermes_control_config(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> HermesControlConfig:
+    return resolve_hermes_control_config(
+        profile,
+        activation_backend=getattr(args, "hermes_activation_backend", None),
+        reply_writeback_mode=getattr(args, "hermes_reply_writeback_mode", None),
+        gateway_python=getattr(args, "hermes_gateway_python", None),
+    )
+
+
+def _validated_codex_activation_backend(value: object) -> str:
+    if not isinstance(value, str) or value.strip() not in {
+        "exec_resume",
+        "app_server",
+    }:
+        raise ValueError(
+            "codexActivationBackend must be 'exec_resume' or 'app_server'."
+        )
+    return value.strip()
+
+
+def _codex_app_server_approval_decision(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> tuple[str, str]:
+    explicit = getattr(args, "codex_app_server_approval_decision", None)
+    if explicit is not None:
+        return _validated_codex_app_server_approval_decision(explicit), "explicit_cli"
+    for key in (
+        "codexAppServerApprovalDecision",
+        "codex_app_server_approval_decision",
+    ):
+        value = profile.get(key)
+        if value is not None:
+            return _validated_codex_app_server_approval_decision(value), "profile"
+    return "decline", "default"
+
+
+def _validated_codex_app_server_approval_decision(value: object) -> str:
+    allowed = {"decline", "cancel", "accept", "accept_for_session"}
+    if not isinstance(value, str) or value.strip() not in allowed:
+        raise ValueError(
+            "codexAppServerApprovalDecision must be one of: "
+            "decline, cancel, accept, accept_for_session."
+        )
     return value.strip()
 
 
@@ -2362,16 +3128,23 @@ def _apply_workspace_id_default(
 
 
 def _workspace_id_default(profile: Mapping[str, object]) -> str | None:
+    profile_workspace_id = _workspace_id_from_profile(profile)
+    if profile_workspace_id is not None:
+        return profile_workspace_id
+    for key in ("AGENT_OS_WORKSPACE_ID", "AGENT_OS_WORKSPACE"):
+        value = os.environ.get(key)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _workspace_id_from_profile(profile: Mapping[str, object]) -> str | None:
     for key in ("workspaceId", "workspace_id", "workspace"):
         value = profile.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
         if value is not None:
             raise ValueError(f"profile {key} must be a string.")
-    for key in ("AGENT_OS_WORKSPACE_ID", "AGENT_OS_WORKSPACE"):
-        value = os.environ.get(key)
-        if value is not None and value.strip():
-            return value.strip()
     return None
 
 
@@ -2717,6 +3490,43 @@ def _dispatch(
             ticket_path=args.ticket_path,
             response_path=args.response_path,
         )
+    if args.command == "deepseek-harness-runtime-preflight":
+        profile = _local_runtime_profile(application.settings.profile_path)
+        control = _deepseek_harness_control_config(
+            args,
+            profile,
+            settings=application.settings,
+            require_runtime_paths=False,
+        )
+        for key in ("carrier", "executablePath", "packageRoot"):
+            if not isinstance(control.get(key), str) or not str(control[key]).strip():
+                raise ValueError(f"deepseekHarnessControl.{key} is required.")
+        return {
+            "schema": "deepseek_harness_runtime_preflight_command.v1",
+            "control": control,
+            "preflight": preflight_deepseek_harness_runtime(
+                carrier=str(control["carrier"]),
+                executable_path=str(control["executablePath"]),
+                package_root=str(control["packageRoot"]),
+                cordis_config_path=(
+                    str(control["cordisConfigPath"])
+                    if control.get("cordisConfigPath") is not None
+                    else None
+                ),
+                runtime_home=(
+                    str(control["runtimeHome"])
+                    if control.get("runtimeHome") is not None
+                    else None
+                ),
+                state_root=str(control["stateRoot"]),
+                session_root=str(control["sessionRoot"]),
+                session_id=args.session_id,
+                session_start_mode=(
+                    "resume" if args.session_id is not None else "create"
+                ),
+                session_compression=str(control["sessionCompression"]),
+            ),
+        }
     if args.command == "workspace-create":
         return application.create_workspace(
             workspace_id=args.workspace_id,
@@ -2727,6 +3537,16 @@ def _dispatch(
         )
     if args.command == "workspace-list":
         return application.list_workspaces()
+    if args.command == "console-workspace-list":
+        return application.list_console_workspaces()
+    if args.command == "console-provider-backends":
+        return application.get_console_provider_backends()
+    if args.command == "console-workspace-view":
+        return application.get_console_workspace_view(
+            workspace_id=args.workspace_id,
+            cursor=args.cursor,
+            limit=args.limit,
+        )
     if args.command == "workspace-open":
         return application.open_workspace(args.workspace_id)
     if args.command == "workspace-archive":
@@ -2855,7 +3675,7 @@ def _dispatch(
             ),
         )
         return _agent_exchange_compact_status(result) if args.format == "compact" else result
-    if args.command == "agent-exchange-request-respond":
+    if args.command in {"agent-exchange-request-respond", "agent-reply", "reply"}:
         return application.respond_agent_exchange_request(
             workspace_id=args.workspace_id,
             exchange_request_id=args.exchange_request_id,
@@ -2904,13 +3724,23 @@ def _dispatch(
             dry_run=args.dry_run,
         )
     if args.command == "agent-dispatch-send":
+        local_profile = _local_runtime_profile(application.settings.profile_path)
         codex_repo_check_policy, codex_repo_check_policy_source = (
-            _codex_git_repo_check_policy(
-                args,
-                _local_runtime_profile(application.settings.profile_path),
-            )
+            _codex_git_repo_check_policy(args, local_profile)
         )
-        return application.send_agent_dispatch(
+        codex_control = _codex_control_config(args, local_profile)
+        claude_control = _claude_control_config(args, local_profile)
+        hermes_control = _hermes_control_config(args, local_profile)
+        dispatch_control = _agent_dispatch_control_config(args, local_profile)
+        delivery_mode, delivery_mode_source = _dispatch_delivery_mode_from_args(
+            args,
+            dispatch_control,
+        )
+        codex_activation_backend = codex_control.activation_backend.value
+        codex_app_server_approval_decision, _ = (
+            _codex_app_server_approval_decision(args, local_profile)
+        )
+        result = application.send_agent_dispatch(
             workspace_id=args.workspace_id,
             dispatch_id=args.dispatch_id,
             exchange_request_id=args.exchange_request_id,
@@ -2938,7 +3768,14 @@ def _dispatch(
             expires_at=_optional_datetime_arg(args.expires_at, "expires-at"),
             requires_user_review=args.requires_user_review,
             metadata=_metadata_from_args(args),
-            delivery_mode=_dispatch_delivery_mode_from_args(args),
+            delivery_mode=delivery_mode,
+            delivery_mode_source=delivery_mode_source,
+            immediate_busy_policy=(
+                dispatch_control.immediate_busy_policy.value
+            ),
+            immediate_busy_policy_source=(
+                dispatch_control.immediate_busy_policy.source
+            ),
             dispatcher_id=args.dispatcher_id,
             lease_ttl_seconds=args.lease_ttl_seconds,
             retry_delay_seconds=args.retry_delay_seconds,
@@ -2953,6 +3790,8 @@ def _dispatch(
             claude_allowed_tools=tuple(args.claude_allowed_tool),
             claude_permission_mode=args.claude_permission_mode,
             claude_settings_path=args.claude_settings_path,
+            claude_activation_backend=claude_control.activation_backend.value,
+            claude_reply_writeback_mode=claude_control.reply_writeback_mode.value,
             codex_executable=args.codex_executable,
             codex_default_platform_workspace_add_dir=(
                 not args.no_codex_default_platform_workspace_add_dir
@@ -2962,8 +3801,24 @@ def _dispatch(
             codex_approval_policy=args.codex_approval_policy,
             codex_git_repo_check_policy=codex_repo_check_policy,
             codex_git_repo_check_policy_source=codex_repo_check_policy_source,
+            codex_activation_backend=codex_activation_backend,
+            codex_app_server_approval_decision=(
+                codex_app_server_approval_decision
+            ),
+            codex_busy_delivery_policy=codex_control.busy_delivery_policy.value,
+            codex_busy_delivery_policy_explicit=(
+                codex_control.busy_delivery_policy.source != "default"
+            ),
+            codex_reply_writeback_mode=codex_control.reply_writeback_mode.value,
             hermes_executable=args.hermes_executable,
             hermes_home=args.hermes_home,
+            hermes_activation_backend=hermes_control.activation_backend.value,
+            hermes_reply_writeback_mode=hermes_control.reply_writeback_mode.value,
+            hermes_gateway_python=(
+                hermes_control.gateway_python.value
+                if hermes_control.gateway_python is not None
+                else None
+            ),
             hermes_source_tag=args.hermes_source_tag,
             hermes_max_turns=args.hermes_max_turns,
             activation_timeout_seconds=args.activation_timeout_seconds,
@@ -2971,6 +3826,13 @@ def _dispatch(
             read_live_runtime_status=args.runtime_status_policy,
             dry_run=args.dry_run,
         )
+        return {
+            **dict(result),
+            "claudeControl": claude_control.to_metadata(),
+            "codexControl": codex_control.to_metadata(),
+            "hermesControl": hermes_control.to_metadata(),
+            "dispatchControl": dispatch_control.to_metadata(),
+        }
     if args.command == "agent-dispatch-list":
         return application.list_agent_dispatches(
             workspace_id=args.workspace_id,
@@ -3028,13 +3890,18 @@ def _dispatch(
     if args.command == "agent-dispatch-worker-run-once":
         if args.dry_run == args.execute:
             raise ValueError("choose exactly one of --dry-run or --execute.")
+        local_profile = _local_runtime_profile(application.settings.profile_path)
         codex_repo_check_policy, codex_repo_check_policy_source = (
-            _codex_git_repo_check_policy(
-                args,
-                _local_runtime_profile(application.settings.profile_path),
-            )
+            _codex_git_repo_check_policy(args, local_profile)
         )
-        return application.run_agent_dispatch_worker_once(
+        codex_control = _codex_control_config(args, local_profile)
+        claude_control = _claude_control_config(args, local_profile)
+        hermes_control = _hermes_control_config(args, local_profile)
+        codex_activation_backend = codex_control.activation_backend.value
+        codex_app_server_approval_decision, _ = (
+            _codex_app_server_approval_decision(args, local_profile)
+        )
+        result = application.run_agent_dispatch_worker_once(
             workspace_id=args.workspace_id,
             dispatch_id=args.dispatch_id,
             target_agent_id=args.target_agent_id,
@@ -3053,6 +3920,8 @@ def _dispatch(
             claude_allowed_tools=tuple(args.claude_allowed_tool),
             claude_permission_mode=args.claude_permission_mode,
             claude_settings_path=args.claude_settings_path,
+            claude_activation_backend=claude_control.activation_backend.value,
+            claude_reply_writeback_mode=claude_control.reply_writeback_mode.value,
             codex_executable=args.codex_executable,
             codex_default_platform_workspace_add_dir=(
                 not args.no_codex_default_platform_workspace_add_dir
@@ -3062,8 +3931,21 @@ def _dispatch(
             codex_approval_policy=args.codex_approval_policy,
             codex_git_repo_check_policy=codex_repo_check_policy,
             codex_git_repo_check_policy_source=codex_repo_check_policy_source,
+            codex_activation_backend=codex_activation_backend,
+            codex_app_server_approval_decision=(
+                codex_app_server_approval_decision
+            ),
+            codex_busy_delivery_policy=codex_control.busy_delivery_policy.value,
+            codex_reply_writeback_mode=codex_control.reply_writeback_mode.value,
             hermes_executable=args.hermes_executable,
             hermes_home=args.hermes_home,
+            hermes_activation_backend=hermes_control.activation_backend.value,
+            hermes_reply_writeback_mode=hermes_control.reply_writeback_mode.value,
+            hermes_gateway_python=(
+                hermes_control.gateway_python.value
+                if hermes_control.gateway_python is not None
+                else None
+            ),
             hermes_source_tag=args.hermes_source_tag,
             hermes_max_turns=args.hermes_max_turns,
             activation_timeout_seconds=args.activation_timeout_seconds,
@@ -3071,6 +3953,12 @@ def _dispatch(
             read_live_runtime_status=args.runtime_status_policy,
             dry_run=args.dry_run,
         )
+        return {
+            **dict(result),
+            "claudeControl": claude_control.to_metadata(),
+            "codexControl": codex_control.to_metadata(),
+            "hermesControl": hermes_control.to_metadata(),
+        }
     if args.command == "agent-exchange-thread-instructions":
         return application.agent_exchange_thread_instructions(args.workspace_id)
     if args.command == "agent-exchange-thread-list":
@@ -3237,6 +4125,7 @@ def _dispatch(
             agent_id=args.agent_id,
             endpoint_alias=args.endpoint_alias,
             provider=args.provider,
+            native_session_id=args.native_session_id,
             read_live_runtime_status=args.runtime_status_policy,
         )
     if args.command == "provider-session-workspace-join":
@@ -3317,6 +4206,126 @@ def _dispatch(
                 "providerSessionMembership": membership["providerSessionMembership"],
             },
         }, registry_resolution)
+    if args.command in {"agent-join", "join"}:
+        if normalize_agent_endpoint_provider(args.provider) == "deepseek_harness":
+            profile = _local_runtime_profile(application.settings.profile_path)
+            control = _deepseek_harness_control_config(
+                args,
+                profile,
+                settings=application.settings,
+                require_runtime_paths=True,
+            )
+            if args.new_session and args.cwd is None:
+                raise ValueError("DeepSeek Harness --new-session requires --cwd.")
+            if args.dry_run:
+                preflight = preflight_deepseek_harness_runtime(
+                    carrier=str(control["carrier"]),
+                    executable_path=str(control["executablePath"]),
+                    package_root=str(control["packageRoot"]),
+                    cordis_config_path=(
+                        str(control["cordisConfigPath"])
+                        if control.get("cordisConfigPath") is not None
+                        else None
+                    ),
+                    runtime_home=str(control["runtimeHome"]),
+                    state_root=str(control["stateRoot"]),
+                    session_root=str(control["sessionRoot"]),
+                    session_id=args.session_id,
+                    session_start_mode=(
+                        "resume" if args.session_id is not None else "create"
+                    ),
+                    session_compression=str(control["sessionCompression"]),
+                )
+                return {
+                    "schema": "deepseek_harness_agent_join.v1",
+                    "ok": preflight.get("supported") is True,
+                    "completed": False,
+                    "dryRun": True,
+                    "provider": "deepseek_harness",
+                    "visibleAgentId": args.agent_id,
+                    "control": control,
+                    "preflight": preflight,
+                    "writesApplied": False,
+                }
+            return application.join_deepseek_harness_agent(
+                workspace_id=args.workspace_id,
+                agent_id=args.agent_id,
+                agent_name=args.agent_name,
+                cwd=args.cwd,
+                carrier=str(control["carrier"]),
+                executable_path=str(control["executablePath"]),
+                package_root=str(control["packageRoot"]),
+                cordis_config_path=(
+                    str(control["cordisConfigPath"])
+                    if control.get("cordisConfigPath") is not None
+                    else None
+                ),
+                runtime_home=str(control["runtimeHome"]),
+                runtime_home_source=str(control["runtimeHomeSource"]),
+                state_root=str(control["stateRoot"]),
+                session_root=str(control["sessionRoot"]),
+                session_id=args.session_id,
+                session_compression=str(control["sessionCompression"]),
+                model_provider=str(control["modelProvider"]),
+                model=str(control["model"]),
+                reply_writeback_mode=str(control["replyWritebackMode"]),
+                created_by=args.created_by,
+                reason=args.reason,
+                initialize_timeout_seconds=float(control["initializeTimeoutSeconds"]),
+                operation_timeout_seconds=float(control["operationTimeoutSeconds"]),
+                shutdown_timeout_seconds=float(control["shutdownTimeoutSeconds"]),
+                max_line_bytes=int(control["maxLineBytes"]),
+                max_total_output_bytes=int(control["maxTotalOutputBytes"]),
+                max_stderr_bytes=int(control["maxStderrBytes"]),
+            )
+        if args.new_session:
+            raise ValueError("--new-session is only supported for deepseek_harness.")
+        return application.join_agent(
+            workspace_id=args.workspace_id,
+            agent_id=args.agent_id,
+            provider=str(normalize_agent_endpoint_provider(args.provider)),
+            session_id=args.session_id,
+            agent_name=args.agent_name,
+            created_by=args.created_by,
+            reason=args.reason,
+            metadata=_json_object(args.metadata_json, "metadata-json"),
+            reuse_existing=not args.no_reuse_existing,
+            dry_run=args.dry_run,
+            limit=args.limit,
+            cwd=args.cwd,
+            claude_home=args.claude_home,
+            codex_home=args.codex_home,
+            hermes_home=args.hermes_home,
+            hermes_executable=args.hermes_executable,
+            hermes_source=args.hermes_source,
+            hermes_timeout_seconds=args.hermes_timeout_seconds,
+        )
+    if args.command == "deepseek-harness-runtime-status":
+        return application.get_deepseek_harness_runtime_status(
+            workspace_id=args.workspace_id,
+            handle_id=args.handle_id,
+        )
+    if args.command == "deepseek-harness-runtime-stop":
+        return application.stop_deepseek_harness_runtime(
+            workspace_id=args.workspace_id,
+            handle_id=args.handle_id,
+            acknowledge_runtime_stop=args.acknowledge_runtime_stop,
+            stopped_by=args.stopped_by,
+        )
+    if args.command == "deepseek-harness-runtime-resume":
+        return application.resume_deepseek_harness_runtime(
+            workspace_id=args.workspace_id,
+            handle_id=args.handle_id,
+            acknowledge_ambiguous_delivery=args.acknowledge_ambiguous_delivery,
+            resumed_by=args.resumed_by,
+        )
+    if args.command == "deepseek-harness-runtime-recreate":
+        return application.recreate_deepseek_harness_runtime(
+            workspace_id=args.workspace_id,
+            handle_id=args.handle_id,
+            acknowledge_continuity_loss=args.acknowledge_continuity_loss,
+            recreated_by=args.recreated_by,
+        )
     if args.command == "agent-provider-onboard":
         return application.onboard_agent_provider(
             workspace_id=args.workspace_id,
@@ -3335,6 +4344,7 @@ def _dispatch(
             reason=args.reason,
             metadata=_json_object(args.metadata_json, "metadata-json"),
             reuse_existing=not args.no_reuse_existing,
+            allow_shared_session_binding=args.allow_shared_session_binding,
             dry_run=args.dry_run,
             limit=args.limit,
             cwd=args.cwd,
@@ -3511,7 +4521,9 @@ def _dispatch(
     if args.command == "claude-registered-session-activate":
         if args.dry_run == args.execute:
             raise ValueError("choose exactly one of --dry-run or --execute.")
-        return application.activate_claude_registered_session(
+        local_profile = _local_runtime_profile(application.settings.profile_path)
+        claude_control = _claude_control_config(args, local_profile)
+        result = application.activate_claude_registered_session(
             workspace_id=args.workspace_id,
             agent_id=args.agent_id,
             handle_id=args.handle_id,
@@ -3526,9 +4538,12 @@ def _dispatch(
             allowed_tools=tuple(args.allowed_tool),
             permission_mode=args.permission_mode,
             settings_path=args.settings_path,
+            activation_backend=claude_control.activation_backend.value,
+            reply_writeback_mode=claude_control.reply_writeback_mode.value,
             dry_run=args.dry_run,
             timeout_seconds=args.timeout_seconds,
         )
+        return {**dict(result), "claudeControl": claude_control.to_metadata()}
     if args.command == "codex-session-handle-register":
         return application.register_codex_session_handle(
             workspace_id=args.workspace_id,
@@ -3559,14 +4574,45 @@ def _dispatch(
             deactivated_by=args.deactivated_by,
             reason=args.reason,
         )
+    if args.command == "codex-session-status":
+        local_profile = _local_runtime_profile(application.settings.profile_path)
+        control = _codex_control_config(args, local_profile)
+        return application.get_codex_session_status(
+            workspace_id=args.workspace_id,
+            agent_id=args.agent_id,
+            handle_id=args.handle_id,
+            status_read_mode=control.status_read_mode.value,
+            codex_executable=args.codex_executable,
+            point_read_timeout_seconds=args.point_read_timeout_seconds,
+            control_config=control.to_metadata(),
+        )
+    if args.command == "codex-session-supplement":
+        local_profile = _local_runtime_profile(application.settings.profile_path)
+        control = _codex_control_config(args, local_profile)
+        return application.submit_codex_session_supplement(
+            workspace_id=args.workspace_id,
+            agent_id=args.agent_id,
+            handle_id=args.handle_id,
+            message=args.message,
+            expected_turn_id=args.expected_turn_id,
+            submitted_by=args.submitted_by,
+            supplement_id=args.supplement_id,
+            supplement_mode=control.supplement_mode.value,
+            wait_once=args.wait == "once",
+            wait_timeout_seconds=args.wait_timeout_seconds,
+            control_config=control.to_metadata(),
+        )
     if args.command == "codex-registered-session-activate":
         if args.dry_run == args.execute:
             raise ValueError("choose exactly one of --dry-run or --execute.")
+        local_profile = _local_runtime_profile(application.settings.profile_path)
         codex_repo_check_policy, codex_repo_check_policy_source = (
-            _codex_git_repo_check_policy(
-                args,
-                _local_runtime_profile(application.settings.profile_path),
-            )
+            _codex_git_repo_check_policy(args, local_profile)
+        )
+        codex_control = _codex_control_config(args, local_profile)
+        codex_activation_backend = codex_control.activation_backend.value
+        codex_app_server_approval_decision, _ = (
+            _codex_app_server_approval_decision(args, local_profile)
         )
         return application.activate_codex_registered_session(
             workspace_id=args.workspace_id,
@@ -3584,6 +4630,10 @@ def _dispatch(
             approval_policy=args.approval_policy,
             git_repo_check_policy=codex_repo_check_policy,
             git_repo_check_policy_source=codex_repo_check_policy_source,
+            activation_backend=codex_activation_backend,
+            app_server_approval_decision=codex_app_server_approval_decision,
+            reply_writeback_mode=codex_control.reply_writeback_mode.value,
+            control_config=codex_control.to_metadata(),
             dry_run=args.dry_run,
             timeout_seconds=args.timeout_seconds,
         )
@@ -3627,7 +4677,9 @@ def _dispatch(
     if args.command == "hermes-registered-session-activate":
         if args.dry_run == args.execute:
             raise ValueError("choose exactly one of --dry-run or --execute.")
-        return application.activate_hermes_registered_session(
+        local_profile = _local_runtime_profile(application.settings.profile_path)
+        hermes_control = _hermes_control_config(args, local_profile)
+        result = application.activate_hermes_registered_session(
             workspace_id=args.workspace_id,
             agent_id=args.agent_id,
             handle_id=args.handle_id,
@@ -3635,12 +4687,20 @@ def _dispatch(
             handoff_directory=args.handoff_directory,
             hermes_executable=args.hermes_executable,
             hermes_home=args.hermes_home,
+            activation_backend=hermes_control.activation_backend.value,
+            reply_writeback_mode=hermes_control.reply_writeback_mode.value,
+            gateway_python=(
+                hermes_control.gateway_python.value
+                if hermes_control.gateway_python is not None
+                else None
+            ),
             platform_workspace_root=args.platform_workspace_root,
             source_tag=args.source_tag,
             max_turns=args.max_turns,
             dry_run=args.dry_run,
             timeout_seconds=args.timeout_seconds,
         )
+        return {**dict(result), "hermesControl": hermes_control.to_metadata()}
     if args.command == "agent-activation-instructions":
         return application.agent_activation_instructions(args.workspace_id)
     if args.command == "agent-activation-wake":
@@ -4030,26 +5090,31 @@ def _add_exchange_attribution_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--exchange-attribution-source")
 
 
-def _dispatch_delivery_mode_from_args(args: argparse.Namespace) -> str:
+def _agent_dispatch_control_config(
+    args: argparse.Namespace,
+    profile: Mapping[str, object],
+) -> AgentDispatchControlConfig:
+    return resolve_agent_dispatch_control_config(
+        profile,
+        immediate_busy_policy=getattr(args, "immediate_busy_policy", None),
+    )
+
+
+def _dispatch_delivery_mode_from_args(
+    args: argparse.Namespace,
+    config: AgentDispatchControlConfig | None = None,
+) -> tuple[str, str]:
+    resolved_config = config or resolve_agent_dispatch_control_config({})
     delivery_mode = getattr(args, "delivery_mode", None)
     wait_mode = getattr(args, "wait", None)
     queued = bool(getattr(args, "queued", False))
-    if wait_mode == "once" and queued:
-        raise ValueError("--wait once cannot be combined with --queued.")
-    if wait_mode == "once":
-        if delivery_mode is not None and delivery_mode != "worker_execute":
-            raise ValueError(
-                "--wait once requires --delivery-mode worker_execute when both "
-                "are provided."
-            )
-        return "worker_execute"
-    if queued:
-        if delivery_mode is not None and delivery_mode != "queued":
-            raise ValueError(
-                "--queued requires --delivery-mode queued when both are provided."
-            )
-        return "queued"
-    return delivery_mode or "queued"
+    selection = resolve_agent_dispatch_delivery_mode(
+        delivery_mode=delivery_mode,
+        wait_mode=wait_mode,
+        queued=queued,
+        default_selection=resolved_config.default_delivery_mode,
+    )
+    return selection.value, selection.source
 
 
 def _metadata_from_args(args: argparse.Namespace) -> dict[str, object] | None:
@@ -4136,14 +5201,16 @@ def _provider_onboard_session_id_from_args(
 
 def _response_metadata_from_args(args: argparse.Namespace) -> dict[str, object] | None:
     metadata = _metadata_from_args(args) or {}
-    if args.response_source is not None:
+    response_source = getattr(args, "response_source", None)
+    if response_source is not None:
         metadata["responseSource"] = _non_empty_text(
-            args.response_source,
+            response_source,
             "response-source",
         )
-    if args.actual_writer_agent_id is not None:
+    actual_writer_agent_id = getattr(args, "actual_writer_agent_id", None)
+    if actual_writer_agent_id is not None:
         metadata["actualWriterAgentId"] = _non_empty_text(
-            args.actual_writer_agent_id,
+            actual_writer_agent_id,
             "actual-writer-agent-id",
         )
         metadata["claimedRespondingAgentId"] = args.responding_agent_id
@@ -4371,28 +5438,36 @@ def _agent_wake_profile_from_args(args: argparse.Namespace) -> dict[str, object]
 _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
     "onboarding": {
         "summary": (
-            "Profile-first path: resolve a local runtime profile, create or reuse "
-            "a workspace agent, bind a provider session handle, login an endpoint "
-            "alias, then check alias dispatch readiness."
+            "Initialize the project workspace once, then join each provider "
+            "session with one visible agent id. Beacon binds the agent, exact "
+            "native session, and same-named endpoint through a preflighted "
+            "idempotent workflow. DeepSeek Harness can resume an exact persisted "
+            "session with --session or create one with --new-session. Already-joined DSH Agents "
+            "query their mapping and use send/reply; do not join again on every request."
         ),
         "flow": (
-            "local-runtime-profile-init",
-            "agent-provider-onboard",
+            "agent-workspace-init",
+            "agent-join --agent <visible-id> --provider <provider> --session <native-session-id>",
+            "agent-join --agent <visible-id> --provider deepseek_harness --new-session --cwd <project-root>",
             "agent-onboarding-status",
-            "agent-dispatch-send",
+            "agent-dispatch-send --as <source-id> --to <target-id> --message <request>",
         ),
         "commands": (
             {
-                "command": "local-runtime-profile-init",
-                "purpose": "Create an isolated workspace database/root/plugins path and reusable --profile file.",
+                "command": "agent-workspace-init",
+                "purpose": (
+                    "Create the project marker and isolated local workspace "
+                    "profile once; use --existing-database to explicitly attach "
+                    "a known legacy workspace without scanning or copying it."
+                ),
             },
             {
-                "command": "agent-provider-onboard",
-                "purpose": "Idempotently create/reuse agent, provider handle, and endpoint alias.",
+                "command": "agent-join",
+                "purpose": "Preflight and idempotently join an exact native session, including a persisted DSH session, or create a new Beacon-owned DSH session with --new-session.",
             },
             {
                 "command": "agent-onboarding-status",
-                "purpose": "Read workspace agents, handles, endpoint aliases, readiness, and next actions.",
+                "purpose": "Read registered workspace agents, handles, aliases and readiness; --provider dsh --native-session-id <exact-id> resolves matched/missing/ambiguous/inactive mappings without discovery or runtime startup.",
             },
             {
                 "command": "agent-help --topic status",
@@ -4402,20 +5477,29 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
     },
     "session": {
         "summary": (
-            "Provider sessions are local Beacon bindings to existing Claude, "
-            "Codex, or Hermes sessions. Discovery and reusable local provider "
-            "session profiles are metadata-only by default."
+            "The normal path is agent-join with an explicit native session id. "
+            "Advanced discovery and reusable local provider session profiles "
+            "remain available for Claude/Codex/Hermes. DeepSeek Harness performs "
+            "an exact header-only lookup in its configured persistence root; it "
+            "does not provide automatic discovery or reusable profile import."
         ),
         "flow": (
+            "agent-join --agent <visible-id> --provider <provider> --session <native-session-id>",
+            "agent-join --agent <visible-id> --provider deepseek_harness --new-session --cwd <project-root>",
             "provider-session-profile-register",
             "provider-session-workspace-join",
             "provider-session-membership-list",
             "agent-session-discover",
             "agent-session-handle-register-discovered",
             "claude/codex/hermes-session-handle-list",
-            "agent-provider-onboard",
+            "deepseek-harness-runtime-status/stop/resume/recreate",
+            "agent-onboarding-status --provider dsh --native-session-id <exact-native-id>",
         ),
         "commands": (
+            {
+                "command": "agent-join",
+                "purpose": "Preferred combined path: bind agent identity, exact native session, and visible endpoint alias.",
+            },
             {
                 "command": "provider-session-profile-register",
                 "purpose": "Create/reuse a local provider session metadata profile that is not bound to one workspace.",
@@ -4446,7 +5530,11 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
             },
             {
                 "command": "agent-provider-onboard",
-                "purpose": "Preferred combined path for new agents.",
+                "purpose": "Advanced compatibility path exposing the lower-level onboarding parameters.",
+            },
+            {
+                "command": "agent-onboarding-status --provider dsh --agent-id <agent-id> --alias <alias>",
+                "purpose": "Already-joined DSH use: confirm delivered identity and same-workspace members. Use explicit --profile outside the project; --as is routing, not authentication. Exact persisted-session join is supported; automatic discovery/profile import is not.",
             },
         ),
     },
@@ -4487,10 +5575,15 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
     },
     "dispatch": {
         "summary": (
-            "Alias dispatch sends through Beacon queue state. Daemon polling and "
-            "worker_execute affect delivery timing, not endpoint login semantics."
+            "Alias dispatch performs one bounded inline send by default; "
+            "worker_execute and --wait once are compatibility spellings. "
+            "Busy targets return a caller decision; explicit queued mode is the "
+            "advanced worker/daemon path. Provider output is not automatically "
+            "written back as a reply unless that policy is explicitly enabled."
         ),
         "flow": (
+            "agent-dispatch-send --as <source> --to <target> --message <short-request>",
+            "agent-reply --request <request-id> --agent <receiver-id> --message <chosen-reply>",
             "agent-dispatch-send --as <source> --to <target> --queued",
             "agent-dispatch-daemon-start",
             "agent-dispatch-worker-run-once",
@@ -4500,7 +5593,11 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
         "commands": (
             {
                 "command": "agent-dispatch-send",
-                "purpose": "Declare --as source and --to target, preview the route, or create request/dispatch state; --as is not authentication.",
+                "purpose": "Attempt one bounded delivery by default; use --queued only when a worker/daemon will consume it. Busy results require an explicit caller choice.",
+            },
+            {
+                "command": "agent-reply",
+                "purpose": "Optionally send a receiver-selected reply; delivery does not imply that a reply is required.",
             },
             {
                 "command": "agent-dispatch-daemon-start",
@@ -4530,6 +5627,8 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
             "agent-endpoint-status",
             "agent-dispatch-daemon-status",
             "agent-provider-runtime-status",
+            "codex-session-status",
+            "codex-session-supplement",
             "agent-dispatch-status --format compact",
             "agent-dispatch-lease-reconcile --dry-run",
         ),
@@ -4549,6 +5648,14 @@ _AGENT_HELP_TOPICS: dict[str, Mapping[str, object]] = {
             {
                 "command": "agent-provider-runtime-status",
                 "purpose": "Read metadata state and auto-run only a configured safe local JSON probe; policy can be disabled or enabled.",
+            },
+            {
+                "command": "codex-session-status",
+                "purpose": "Read a registered Codex target, preferring a live Beacon-owned app-server runtime and optionally using one short thread/read point query.",
+            },
+            {
+                "command": "codex-session-supplement",
+                "purpose": "Explicitly queue guidance for the current Beacon-owned Codex turn; the owning stdio runner alone may deliver it with turn/steer.",
             },
             {
                 "command": "agent-dispatch-status",
@@ -4573,6 +5680,9 @@ def _agent_help(topic: str) -> Mapping[str, object]:
         "commands": [dict(item) for item in data["commands"]],
         "boundaries": {
             "profileFirst": True,
+            "projectScopeMarker": ".beacon/workspace.json",
+            "canonicalJoinCommand": "agent-join",
+            "canonicalReplyCommand": "agent-reply",
             "providerOnboardCommand": "agent-provider-onboard",
             "credentialStored": False,
             "providerSessionProfileIsAccountLogin": False,
@@ -4580,6 +5690,8 @@ def _agent_help(topic: str) -> Mapping[str, object]:
             "internalMigrationHistoryIncluded": False,
             "callerIdentityAuthenticated": False,
             "automaticCurrentSessionDetection": False,
+            "automaticProviderFinalReplyCapture": False,
+            "databaseScanningForProjectScope": False,
         },
     }
 
@@ -4914,6 +6026,9 @@ def _agent_onboarding_status_text(payload: Mapping[str, object]) -> str:
     provider_profiles = payload.get("providerSessionProfiles")
     next_actions = payload.get("nextActions")
     lines = ["Beacon onboarding status"]
+    resolution = payload.get("nativeSessionResolution")
+    if isinstance(resolution, Mapping) and resolution.get("status") != "not_requested":
+        lines.append(f"nativeSessionResolution: {resolution.get('status')} (registered workspace handles only)")
     if isinstance(workspace, Mapping):
         exists = "exists" if workspace.get("exists") else "missing"
         lines.append(f"workspace: {workspace.get('workspaceId')} ({exists})")
@@ -4939,7 +6054,7 @@ def _agent_onboarding_status_text(payload: Mapping[str, object]) -> str:
                 "- handle "
                 f"{item.get('provider')}:{item.get('handleId')} "
                 f"agent={item.get('agentId')} active={str(bool(item.get('active'))).lower()} "
-                f"session={session_id}"
+                f"session={session_id} state={item.get('state')}"
             )
     if isinstance(endpoints, Mapping):
         lines.append(f"endpoints: {endpoints.get('count', 0)}")

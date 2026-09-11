@@ -321,6 +321,7 @@ def _provider_status_adapter_metadata(
         "codex": "codex_app_server_thread_status",
         "hermes": "hermes_run_status",
         "claude": "claude_sdk_owned_session_status",
+        "deepseek_harness": "deepseek_harness_owned_runtime_status",
     }.get(provider, "provider_runtime_status")
     probe_configured = _probe_was_configured(live_status_probe)
     probe_status = (
@@ -353,11 +354,13 @@ def _default_provider_state_source(provider: str, read_mode: str) -> str:
             "codex": "codex_app_server_thread_status_probe",
             "hermes": "hermes_run_status_probe",
             "claude": "claude_sdk_owned_session_status_probe",
+            "deepseek_harness": "deepseek_harness_owned_live_status",
         }.get(provider, "provider_runtime_status_probe")
     return {
         "codex": "codex_app_server_thread_status_snapshot",
         "hermes": "hermes_run_status_snapshot",
         "claude": "claude_sdk_owned_session_status_snapshot",
+        "deepseek_harness": "deepseek_harness_owned_runtime_status_snapshot",
     }.get(provider, "provider_runtime_status_snapshot")
 
 

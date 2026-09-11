@@ -2,3 +2,13 @@ Beacon
 Copyright 2026 Beacon contributors
 
 Licensed under the Apache License, Version 2.0.
+
+The optional `session-console` architecture spike composes the MIT-licensed
+DeepSeek Harness Web distribution at runtime and visually references the
+MIT-licensed zixi project without copying its source or assets. Exact upstream
+revisions, package pins, and scope are recorded in `session-console/NOTICE.md`.
+
+The standalone `desktop` P3-B validation uses the Apache-2.0-or-MIT Tauri v2
+project and MIT-licensed React/Vite packages at exact locked versions. It does
+not bundle DSH or zixi source or assets. Exact pins and the original generated
+Beacon icon provenance are recorded in `desktop/NOTICE.md`.

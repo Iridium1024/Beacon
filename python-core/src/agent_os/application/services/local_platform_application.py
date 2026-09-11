@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Mapping as MappingABC
 from contextlib import contextmanager
@@ -7,10 +8,18 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
+from uuid import uuid4
 
 from agent_os.application.services.agent_endpoint import (
     normalize_agent_endpoint_alias,
     normalize_agent_endpoint_provider,
+)
+from agent_os.application.services.agent_communication_context import (
+    build_beacon_cli_invocation,
+    cli_shell_examples,
+)
+from agent_os.application.services.agent_dispatch_control import (
+    effective_agent_dispatch_semantic_mapping,
 )
 from agent_os.application.services.agent_provider_runtime_status import (
     normalize_provider_runtime_status_read_policy,
@@ -31,6 +40,26 @@ from agent_os.application.services.provider_session_profile import (
     provider_session_profile_ref,
     resolve_provider_session_registry_path,
     synthetic_discovered_session_from_profile,
+)
+from agent_os.application.services.provider_backend_control import (
+    resolve_provider_backend,
+)
+from agent_os.application.services.deepseek_harness_managed_runtime import (
+    DeepSeekHarnessRuntimeError,
+    DeepSeekHarnessRuntimeSpec,
+    build_deepseek_harness_runtime_spec,
+    preflight_deepseek_harness_runtime,
+    launch_deepseek_harness_supervisor,
+    read_runtime_state,
+    request_deepseek_harness_supervisor,
+    runtime_handle_metadata,
+)
+from agent_os.application.services.deepseek_harness_registered_session import (
+    DeepSeekHarnessRegisteredSessionHandleState,
+)
+from agent_os.application.services.console_projection import (
+    ConsoleProjectionService,
+    DEFAULT_TIMELINE_LIMIT,
 )
 from agent_os.domain.entities.context import ContextUpdateKind
 from agent_os.infrastructure.composition.local_platform import (
@@ -90,6 +119,46 @@ class LocalPlatformApplication:
     def list_workspaces(self) -> Mapping[str, object]:
         with self._components() as components:
             return components.operations().list_workspaces()
+
+    def list_console_workspaces(self) -> Mapping[str, object]:
+        """Return the redacted read-only workspace roster for the local console."""
+
+        with self._components() as components:
+            operations = components.operations()
+            return ConsoleProjectionService(
+                operations=operations,
+                event_log=operations.event_log_reader,
+            ).list_workspaces()
+
+    def get_console_provider_backends(self) -> Mapping[str, object]:
+        """Return current Beacon backend capabilities without probing providers."""
+
+        with self._components() as components:
+            operations = components.operations()
+            return ConsoleProjectionService(
+                operations=operations,
+                event_log=operations.event_log_reader,
+            ).provider_backends()
+
+    def get_console_workspace_view(
+        self,
+        *,
+        workspace_id: str,
+        cursor: str | None = None,
+        limit: int = DEFAULT_TIMELINE_LIMIT,
+    ) -> Mapping[str, object]:
+        """Return a bounded heterogeneous-session view with no mutation surface."""
+
+        with self._components() as components:
+            operations = components.operations()
+            return ConsoleProjectionService(
+                operations=operations,
+                event_log=operations.event_log_reader,
+            ).workspace_view(
+                workspace_id,
+                cursor=cursor,
+                limit=limit,
+            )
 
     def open_workspace(self, workspace_id: str) -> Mapping[str, object]:
         with self._components() as components:
@@ -615,7 +684,10 @@ class LocalPlatformApplication:
         expires_at: datetime | None = None,
         requires_user_review: bool = False,
         metadata: Mapping[str, object] | None = None,
-        delivery_mode: str = "queued",
+        delivery_mode: str = "worker_execute",
+        delivery_mode_source: str = "default",
+        immediate_busy_policy: str = "return_to_sender",
+        immediate_busy_policy_source: str = "default",
         dispatcher_id: str = "agent-dispatch-worker",
         lease_ttl_seconds: int | None = 300,
         retry_delay_seconds: int = 300,
@@ -628,6 +700,8 @@ class LocalPlatformApplication:
         claude_allowed_tools: tuple[str, ...] = (),
         claude_permission_mode: str | None = None,
         claude_settings_path: str | None = None,
+        claude_activation_backend: str = "cli",
+        claude_reply_writeback_mode: str | None = None,
         codex_executable: str = "codex",
         codex_default_platform_workspace_add_dir: bool = True,
         codex_add_dirs: tuple[str, ...] = (),
@@ -635,8 +709,16 @@ class LocalPlatformApplication:
         codex_approval_policy: str | None = None,
         codex_git_repo_check_policy: str = "skip",
         codex_git_repo_check_policy_source: str = "default",
+        codex_activation_backend: str = "exec_resume",
+        codex_app_server_approval_decision: str = "decline",
+        codex_busy_delivery_policy: str = "queue_next_turn",
+        codex_busy_delivery_policy_explicit: bool = False,
+        codex_reply_writeback_mode: str = "explicit_only",
         hermes_executable: str = "hermes",
         hermes_home: str | None = None,
+        hermes_activation_backend: str = "cli",
+        hermes_reply_writeback_mode: str | None = None,
+        hermes_gateway_python: str | None = None,
         hermes_source_tag: str = "agent-os",
         hermes_max_turns: int | None = None,
         activation_timeout_seconds: int = 120,
@@ -648,10 +730,10 @@ class LocalPlatformApplication:
             raise ValueError(
                 "deliveryMode must be one of: queued, worker_dry_run, worker_execute."
             )
-        if dry_run and delivery_mode != "queued":
+        if immediate_busy_policy not in ("return_to_sender", "queue_next_turn"):
             raise ValueError(
-                "--dry-run only previews dispatch creation; use "
-                "--delivery-mode queued with --dry-run."
+                "immediateBusyPolicy must be one of: return_to_sender, "
+                "queue_next_turn."
             )
         resolved_message = _optional_text(message)
         resolved_request_summary = _optional_text(request_summary) or resolved_message
@@ -689,6 +771,9 @@ class LocalPlatformApplication:
         enriched_metadata = _agent_dispatch_send_metadata(
             metadata,
             delivery_mode=delivery_mode,
+            delivery_mode_source=delivery_mode_source,
+            immediate_busy_policy=immediate_busy_policy,
+            immediate_busy_policy_source=immediate_busy_policy_source,
             message_input_provided=resolved_message is not None,
             endpoint_alias_resolution=endpoint_resolution.to_metadata(),
         )
@@ -725,15 +810,24 @@ class LocalPlatformApplication:
             return {
                 "schema": "agent_dispatch_send.v1",
                 "apiLayer": "delivery-oriented",
-                "dispatchApiLayer": _agent_dispatch_api_layer(delivery_mode),
+                "dispatchApiLayer": _agent_dispatch_api_layer(
+                    delivery_mode,
+                    dry_run=True,
+                ),
                 "workspaceId": workspace_id,
                 "deliveryMode": delivery_mode,
-                "sendModeSummary": _agent_dispatch_send_mode_summary(delivery_mode),
+                "sendModeSummary": _agent_dispatch_send_mode_summary(
+                    delivery_mode,
+                    dry_run=True,
+                ),
                 "routeSummary": route_summary,
                 "actingIdentity": acting_identity,
                 "dryRun": True,
                 "queuedDispatchCreated": False,
-                "workerRunRequested": False,
+                "workerRunRequested": delivery_mode in (
+                    "worker_dry_run",
+                    "worker_execute",
+                ),
                 "workerExecuted": False,
                 "agentDispatch": created_dispatch,
                 "plannedAgentExchangeRequest": created.get(
@@ -768,6 +862,16 @@ class LocalPlatformApplication:
                     profile_path=self.settings.profile_path,
                 ),
                 "endpointAliasResolution": endpoint_resolution.to_metadata(),
+                "deliveryDecision": _agent_dispatch_delivery_decision(
+                    delivery_mode=delivery_mode,
+                    delivery_mode_source=delivery_mode_source,
+                    immediate_busy_policy=immediate_busy_policy,
+                    immediate_busy_policy_source=immediate_busy_policy_source,
+                    dry_run=True,
+                    worker_run=None,
+                    status=None,
+                    target_provider=endpoint_resolution.target_provider,
+                ),
             }
 
         worker_run: Mapping[str, object] | None = None
@@ -790,6 +894,8 @@ class LocalPlatformApplication:
                 claude_allowed_tools=claude_allowed_tools,
                 claude_permission_mode=claude_permission_mode,
                 claude_settings_path=claude_settings_path,
+                claude_activation_backend=claude_activation_backend,
+                claude_reply_writeback_mode=claude_reply_writeback_mode,
                 codex_executable=codex_executable,
                 codex_default_platform_workspace_add_dir=(
                     codex_default_platform_workspace_add_dir
@@ -801,8 +907,21 @@ class LocalPlatformApplication:
                 codex_git_repo_check_policy_source=(
                     codex_git_repo_check_policy_source
                 ),
+                codex_activation_backend=codex_activation_backend,
+                codex_app_server_approval_decision=(
+                    codex_app_server_approval_decision
+                ),
+                codex_busy_delivery_policy=codex_busy_delivery_policy,
+                codex_busy_delivery_policy_explicit=(
+                    codex_busy_delivery_policy_explicit
+                ),
+                codex_reply_writeback_mode=codex_reply_writeback_mode,
+                immediate_busy_policy=immediate_busy_policy,
                 hermes_executable=hermes_executable,
                 hermes_home=hermes_home,
+                hermes_activation_backend=hermes_activation_backend,
+                hermes_reply_writeback_mode=hermes_reply_writeback_mode,
+                hermes_gateway_python=hermes_gateway_python,
                 hermes_source_tag=hermes_source_tag,
                 hermes_max_turns=hermes_max_turns,
                 activation_timeout_seconds=activation_timeout_seconds,
@@ -814,7 +933,9 @@ class LocalPlatformApplication:
         status = self.get_agent_dispatch_status(
             workspace_id=workspace_id,
             dispatch_id=resolved_dispatch_id,
-            read_live_runtime_status=read_live_runtime_status,
+            read_live_runtime_status=(
+                "disabled" if delivery_mode == "queued" else read_live_runtime_status
+            ),
         )
         return {
             "schema": "agent_dispatch_send.v1",
@@ -822,6 +943,7 @@ class LocalPlatformApplication:
             "dispatchApiLayer": _agent_dispatch_api_layer(delivery_mode),
             "workspaceId": workspace_id,
             "deliveryMode": delivery_mode,
+            "deliveryType": "new_turn",
             "sendModeSummary": _agent_dispatch_send_mode_summary(delivery_mode),
             "routeSummary": route_summary,
             "actingIdentity": acting_identity,
@@ -860,6 +982,16 @@ class LocalPlatformApplication:
             "endpointAliasResolution": endpoint_resolution.to_metadata(),
             "sourceEventSequence": created.get("sourceEventSequence"),
             "requestSourceEventSequence": created.get("requestSourceEventSequence"),
+            "deliveryDecision": _agent_dispatch_delivery_decision(
+                delivery_mode=delivery_mode,
+                delivery_mode_source=delivery_mode_source,
+                immediate_busy_policy=immediate_busy_policy,
+                immediate_busy_policy_source=immediate_busy_policy_source,
+                dry_run=False,
+                worker_run=worker_run,
+                status=status,
+                target_provider=endpoint_resolution.target_provider,
+            ),
         }
 
     def _resolve_dispatch_endpoint_aliases(
@@ -1163,6 +1295,8 @@ class LocalPlatformApplication:
         claude_allowed_tools: tuple[str, ...] = (),
         claude_permission_mode: str | None = None,
         claude_settings_path: str | None = None,
+        claude_activation_backend: str = "cli",
+        claude_reply_writeback_mode: str | None = None,
         codex_executable: str = "codex",
         codex_default_platform_workspace_add_dir: bool = True,
         codex_add_dirs: tuple[str, ...] = (),
@@ -1170,8 +1304,17 @@ class LocalPlatformApplication:
         codex_approval_policy: str | None = None,
         codex_git_repo_check_policy: str = "skip",
         codex_git_repo_check_policy_source: str = "default",
+        codex_activation_backend: str = "exec_resume",
+        codex_app_server_approval_decision: str = "decline",
+        codex_busy_delivery_policy: str = "queue_next_turn",
+        codex_busy_delivery_policy_explicit: bool = False,
+        codex_reply_writeback_mode: str = "explicit_only",
+        immediate_busy_policy: str = "queue_next_turn",
         hermes_executable: str = "hermes",
         hermes_home: str | None = None,
+        hermes_activation_backend: str = "cli",
+        hermes_reply_writeback_mode: str | None = None,
+        hermes_gateway_python: str | None = None,
         hermes_source_tag: str = "agent-os",
         hermes_max_turns: int | None = None,
         activation_timeout_seconds: int = 120,
@@ -1202,6 +1345,8 @@ class LocalPlatformApplication:
                 claude_allowed_tools=claude_allowed_tools,
                 claude_permission_mode=claude_permission_mode,
                 claude_settings_path=claude_settings_path,
+                claude_activation_backend=claude_activation_backend,
+                claude_reply_writeback_mode=claude_reply_writeback_mode,
                 codex_executable=codex_executable,
                 codex_default_platform_workspace_add_dir=(
                     codex_default_platform_workspace_add_dir
@@ -1213,8 +1358,21 @@ class LocalPlatformApplication:
                 codex_git_repo_check_policy_source=(
                     codex_git_repo_check_policy_source
                 ),
+                codex_activation_backend=codex_activation_backend,
+                codex_app_server_approval_decision=(
+                    codex_app_server_approval_decision
+                ),
+                codex_busy_delivery_policy=codex_busy_delivery_policy,
+                codex_busy_delivery_policy_explicit=(
+                    codex_busy_delivery_policy_explicit
+                ),
+                codex_reply_writeback_mode=codex_reply_writeback_mode,
+                immediate_busy_policy=immediate_busy_policy,
                 hermes_executable=hermes_executable,
                 hermes_home=hermes_home,
+                hermes_activation_backend=hermes_activation_backend,
+                hermes_reply_writeback_mode=hermes_reply_writeback_mode,
+                hermes_gateway_python=hermes_gateway_python,
                 hermes_source_tag=hermes_source_tag,
                 hermes_max_turns=hermes_max_turns,
                 activation_timeout_seconds=activation_timeout_seconds,
@@ -1495,6 +1653,7 @@ class LocalPlatformApplication:
         snippet_turn_index: int | None = None,
         snippet_max_chars: int = 160,
     ) -> Mapping[str, object]:
+        self.open_workspace(workspace_id)
         discovery = self.discover_agent_sessions(
             provider=provider,
             limit=limit,
@@ -1628,6 +1787,7 @@ class LocalPlatformApplication:
         normalized_provider = normalize_agent_endpoint_provider(provider)
         if normalized_provider is None:
             raise ValueError("provider must be one of: claude, codex, hermes.")
+        self.open_workspace(workspace_id)
         discovery = self.discover_agent_sessions(
             provider=normalized_provider,
             limit=limit,
@@ -1765,6 +1925,7 @@ class LocalPlatformApplication:
         block_source_endpoint_aliases: Sequence[str] = (),
         block_source_agent_ids: Sequence[str] = (),
         block_source_handle_ids: Sequence[str] = (),
+        allow_shared_session_binding: bool = False,
     ) -> Mapping[str, object]:
         normalized_provider = normalize_agent_endpoint_provider(provider)
         if normalized_provider is None:
@@ -1776,6 +1937,20 @@ class LocalPlatformApplication:
             current_session_id
         )
         stages: list[Mapping[str, object]] = []
+        try:
+            self.open_workspace(workspace_id)
+        except ValueError as exc:
+            return _agent_provider_onboard_failure(
+                settings=self.settings,
+                workspace_id=workspace_id,
+                endpoint_alias=normalized_alias,
+                provider=normalized_provider,
+                failed_stage="workspacePreflight",
+                stages=stages,
+                message=str(exc),
+                discovery={},
+                dry_run=dry_run,
+            )
         discovery = self.discover_agent_sessions(
             provider=normalized_provider,
             limit=limit,
@@ -1835,6 +2010,33 @@ class LocalPlatformApplication:
                 "discoveredAgentSession": selected.record,
             }
         )
+
+        preflight_conflict = self._agent_provider_onboard_binding_conflict(
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            provider=normalized_provider,
+            session_id=str(selected.record["sessionId"]),
+            endpoint_alias=normalized_alias,
+            handle_id=handle_id,
+            endpoint_id=endpoint_id,
+            direction=normalized_direction,
+            default_reply_policy=normalized_reply_policy,
+            contact_policy=contact_policy,
+            allow_shared_session_binding=allow_shared_session_binding,
+        )
+        if preflight_conflict is not None:
+            return _agent_provider_onboard_failure(
+                settings=self.settings,
+                workspace_id=workspace_id,
+                endpoint_alias=normalized_alias,
+                provider=normalized_provider,
+                failed_stage="bindingPreflight",
+                stages=stages,
+                message=str(preflight_conflict["message"]),
+                conflict=preflight_conflict,
+                discovery=discovery,
+                dry_run=dry_run,
+            )
 
         existing_agent = self._find_workspace_agent(
             workspace_id=workspace_id,
@@ -2004,6 +2206,1032 @@ class LocalPlatformApplication:
                 "fullSessionHistoryRead": False,
             },
         }
+
+    def join_agent(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        provider: str,
+        session_id: str,
+        agent_name: str | None = None,
+        created_by: str = "agent",
+        reason: str = "agent join",
+        metadata: Mapping[str, object] | None = None,
+        reuse_existing: bool = True,
+        dry_run: bool = False,
+        limit: int = 100,
+        cwd: str | None = None,
+        claude_home: str | None = None,
+        codex_home: str | None = None,
+        hermes_home: str | None = None,
+        hermes_executable: str = "hermes",
+        hermes_source: str | None = None,
+        hermes_timeout_seconds: float = 15.0,
+    ) -> Mapping[str, object]:
+        normalized_provider = normalize_agent_endpoint_provider(provider)
+        if normalized_provider == "deepseek_harness":
+            raise ValueError(
+                "DeepSeek Harness exact-session join requires managed-runtime "
+                "configuration; use join_deepseek_harness_agent or the agent-join CLI."
+            )
+        visible_agent_id = _required_visible_agent_id(agent_id)
+        exact_session_id = _required_visible_agent_id(session_id)
+        result = self.onboard_agent_provider(
+            workspace_id=workspace_id,
+            agent_id=visible_agent_id,
+            agent_name=_optional_text(agent_name) or visible_agent_id,
+            provider=provider,
+            endpoint_alias=visible_agent_id,
+            description="Beacon joined provider session agent.",
+            session_id=exact_session_id,
+            direction="send_receive",
+            default_reply_policy="source_handle_required",
+            contact_policy="open",
+            created_by=created_by,
+            reason=reason,
+            metadata={
+                **dict(metadata or {}),
+                "agentJoin": {
+                    "schema": "agent_join_metadata.v1",
+                    "visibleAgentId": visible_agent_id,
+                    "exactSessionIdProvided": True,
+                    "primaryEndpointAlias": visible_agent_id,
+                },
+            },
+            reuse_existing=reuse_existing,
+            dry_run=dry_run,
+            limit=limit,
+            cwd=cwd,
+            claude_home=claude_home,
+            codex_home=codex_home,
+            hermes_home=hermes_home,
+            hermes_executable=hermes_executable,
+            hermes_source=hermes_source,
+            hermes_timeout_seconds=hermes_timeout_seconds,
+            current_session_id=exact_session_id,
+        )
+        return {
+            "schema": "agent_join.v1",
+            "ok": result.get("ok", False),
+            "completed": result.get("completed", False),
+            "dryRun": dry_run,
+            "workspaceId": workspace_id,
+            "visibleAgentId": visible_agent_id,
+            "provider": normalize_agent_endpoint_provider(provider),
+            "nativeSessionId": exact_session_id,
+            "primaryEndpointAlias": visible_agent_id,
+            "onboarding": result,
+            "ordinarySendAddress": visible_agent_id,
+            "databaseScanned": False,
+            "sessionSelection": "exact_id",
+        }
+
+    def join_deepseek_harness_agent(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        cwd: str | None,
+        carrier: str,
+        executable_path: str,
+        package_root: str,
+        cordis_config_path: str | None,
+        runtime_home: str,
+        runtime_home_source: str,
+        state_root: str,
+        session_root: str,
+        model_provider: str,
+        model: str,
+        session_id: str | None = None,
+        session_compression: str = "zstd",
+        resumed_from: Mapping[str, object] | None = None,
+        reply_writeback_mode: str = "explicit_only",
+        agent_name: str | None = None,
+        created_by: str = "user",
+        reason: str = "join DeepSeek Harness session",
+        initialize_timeout_seconds: float = 30.0,
+        operation_timeout_seconds: float = 120.0,
+        shutdown_timeout_seconds: float = 5.0,
+        max_line_bytes: int = 1024 * 1024,
+        max_total_output_bytes: int = 32 * 1024 * 1024,
+        max_stderr_bytes: int = 64 * 1024,
+    ) -> Mapping[str, object]:
+        """Create or resume, register, and address one Beacon-managed DSH session."""
+
+        visible_agent_id = _required_visible_agent_id(agent_id)
+        self.open_workspace(workspace_id)
+        alias = normalize_agent_endpoint_alias(visible_agent_id)
+        dsh_session_id = (
+            _required_visible_agent_id(session_id)
+            if session_id is not None
+            else f"beacon-dsh-session-{uuid4()}"
+        )
+        session_start_mode = "resume" if session_id is not None else "create"
+        active_endpoints = self.list_agent_endpoints(
+            workspace_id=workspace_id,
+            include_inactive=False,
+        )["agentEndpoints"]
+        existing_handles = self.list_deepseek_harness_session_handles(
+            workspace_id=workspace_id,
+            include_inactive=True,
+        )["deepseekHarnessSessionHandles"]
+        active_session_owners = [
+            item
+            for item in existing_handles
+            if item.get("deepseekHarnessSessionId") == dsh_session_id
+            and item.get("state") == "active"
+        ]
+        if active_session_owners:
+            if len(active_session_owners) != 1:
+                raise ValueError(
+                    "DeepSeek Harness native session has multiple active Beacon "
+                    "owners; resolve the registry conflict before joining."
+                )
+            owner = active_session_owners[0]
+            matching_endpoint = next(
+                (
+                    item
+                    for item in active_endpoints
+                    if item.get("alias") == alias
+                    and item.get("agentId") == visible_agent_id
+                    and item.get("providerHandleId") == owner.get("handleId")
+                ),
+                None,
+            )
+            if owner.get("agentId") == visible_agent_id and matching_endpoint is not None:
+                binding = _deepseek_harness_handle_binding(owner)
+                try:
+                    raw_live_spec = json.loads(
+                        Path(str(binding["runtimeSpecPath"])).read_text(
+                            encoding="utf-8"
+                        )
+                    )
+                    if not isinstance(raw_live_spec, MappingABC):
+                        raise ValueError("runtime spec is not an object")
+                    live_spec = DeepSeekHarnessRuntimeSpec.from_mapping(raw_live_spec)
+                except (KeyError, OSError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "the live DeepSeek Harness binding runtime spec is unreadable; "
+                        "inspect or stop the known owner before joining again."
+                    ) from exc
+
+                def path_differs(current: str | None, requested: str | None) -> bool:
+                    if current is None or requested is None:
+                        return current != requested
+                    return (
+                        Path(current).expanduser().resolve(strict=False)
+                        != Path(requested).expanduser().resolve(strict=False)
+                    )
+
+                conflicts: list[str] = []
+                if cwd is not None and path_differs(live_spec.cwd, cwd):
+                    conflicts.append("cwd")
+                if live_spec.session_compression != session_compression:
+                    conflicts.append("sessionCompression")
+                if live_spec.carrier != carrier:
+                    conflicts.append("carrier")
+                if path_differs(live_spec.executable_path, executable_path):
+                    conflicts.append("executablePath")
+                if path_differs(live_spec.package_root, package_root):
+                    conflicts.append("packageRoot")
+                if path_differs(live_spec.cordis_config_path, cordis_config_path):
+                    conflicts.append("cordisConfigPath")
+                if path_differs(live_spec.runtime_home, runtime_home):
+                    conflicts.append("runtimeHome")
+                if path_differs(
+                    str(Path(live_spec.paths.state_directory).parent),
+                    state_root,
+                ):
+                    conflicts.append("stateRoot")
+                if path_differs(live_spec.session_root, session_root):
+                    conflicts.append("sessionRoot")
+                if live_spec.model_provider != model_provider:
+                    conflicts.append("modelProvider")
+                if live_spec.model != model:
+                    conflicts.append("model")
+                if live_spec.reply_writeback_mode != reply_writeback_mode:
+                    conflicts.append("replyWritebackMode")
+                if live_spec.initialize_timeout_seconds != initialize_timeout_seconds:
+                    conflicts.append("initializeTimeoutSeconds")
+                if live_spec.operation_timeout_seconds != operation_timeout_seconds:
+                    conflicts.append("operationTimeoutSeconds")
+                if live_spec.shutdown_timeout_seconds != shutdown_timeout_seconds:
+                    conflicts.append("shutdownTimeoutSeconds")
+                if live_spec.max_line_bytes != max_line_bytes:
+                    conflicts.append("maxLineBytes")
+                if live_spec.max_total_output_bytes != max_total_output_bytes:
+                    conflicts.append("maxTotalOutputBytes")
+                if live_spec.max_stderr_bytes != max_stderr_bytes:
+                    conflicts.append("maxStderrBytes")
+                if conflicts:
+                    raise ValueError(
+                        "repeat DeepSeek Harness join conflicts with the live "
+                        "binding: " + ", ".join(conflicts)
+                    )
+                status = self.get_deepseek_harness_runtime_status(
+                    workspace_id=workspace_id,
+                    handle_id=str(owner["handleId"]),
+                )
+                runtime_status = status.get("runtimeStatus")
+                if isinstance(runtime_status, MappingABC) and runtime_status.get("ok") is True:
+                    return {
+                        "schema": "deepseek_harness_agent_join.v1",
+                        "ok": True,
+                        "completed": True,
+                        "reused": True,
+                        "workspaceId": workspace_id,
+                        "visibleAgentId": visible_agent_id,
+                        "provider": "deepseek_harness",
+                        "nativeSessionId": dsh_session_id,
+                        "primaryEndpointAlias": alias,
+                        "deepseekHarnessSessionHandle": owner,
+                        "agentEndpoint": matching_endpoint,
+                        "runtime": runtime_status.get("runtimeState"),
+                        "dispatchReady": True,
+                        "existingSessionImport": session_start_mode == "resume",
+                        "sessionStartMode": session_start_mode,
+                        "sessionSelection": "exact_id",
+                        "databaseScanned": False,
+                        "authenticatedRealModelSmokeRun": False,
+                    }
+            raise ValueError(
+                "DeepSeek Harness native session already has an active owner in this workspace."
+            )
+        if any(
+            item.get("agentId") == visible_agent_id and item.get("state") == "active"
+            for item in existing_handles
+        ):
+            raise ValueError(
+                "visible Agent already owns an active DeepSeek Harness session."
+            )
+        endpoint_to_rebind = next(
+            (item for item in active_endpoints if item.get("alias") == alias),
+            None,
+        )
+        if endpoint_to_rebind is not None:
+            old_handle_id = endpoint_to_rebind.get("providerHandleId")
+            old_handle = next(
+                (item for item in existing_handles if item.get("handleId") == old_handle_id),
+                None,
+            )
+            if (
+                session_start_mode != "resume"
+                or endpoint_to_rebind.get("agentId") != visible_agent_id
+                or old_handle is None
+                or old_handle.get("deepseekHarnessSessionId") != dsh_session_id
+                or old_handle.get("state") == "active"
+            ):
+                raise ValueError("visible Agent alias is already active.")
+        previous_same_session = max(
+            (
+                item
+                for item in existing_handles
+                if item.get("agentId") == visible_agent_id
+                and item.get("deepseekHarnessSessionId") == dsh_session_id
+                and item.get("state") != "active"
+            ),
+            key=lambda item: str(item.get("updatedAt") or ""),
+            default=None,
+        )
+        effective_session_root = session_root
+        if previous_same_session is not None:
+            previous_binding = _deepseek_harness_handle_binding(previous_same_session)
+            stored_root = previous_binding.get("sessionRoot")
+            if isinstance(stored_root, str) and stored_root.strip():
+                effective_session_root = stored_root
+
+        preflight = preflight_deepseek_harness_runtime(
+            carrier=carrier,
+            executable_path=executable_path,
+            package_root=package_root,
+            cordis_config_path=cordis_config_path,
+            runtime_home=runtime_home,
+            state_root=state_root,
+            session_root=effective_session_root,
+            session_id=dsh_session_id,
+            session_start_mode=session_start_mode,
+            session_compression=session_compression,
+        )
+        if preflight.get("supported") is not True:
+            return {
+                "schema": "deepseek_harness_agent_join.v1",
+                "ok": False,
+                "completed": False,
+                "failedStage": "runtimePreflight",
+                "workspaceId": workspace_id,
+                "visibleAgentId": visible_agent_id,
+                "provider": "deepseek_harness",
+                "preflight": preflight,
+                "writesApplied": False,
+            }
+
+        if session_start_mode == "resume":
+            probe = preflight.get("sessionProbe")
+            persisted = probe.get("session") if isinstance(probe, MappingABC) else None
+            persisted_cwd = (
+                persisted.get("cwd") if isinstance(persisted, MappingABC) else None
+            )
+            if not isinstance(persisted_cwd, str) or not persisted_cwd.strip():
+                raise ValueError(
+                    "the existing DSH session header does not provide a usable cwd."
+                )
+            resolved_cwd = Path(persisted_cwd).expanduser().resolve()
+            if cwd is not None and Path(cwd).expanduser().resolve() != resolved_cwd:
+                raise ValueError(
+                    "configured cwd conflicts with the persisted DSH session header cwd."
+                )
+        else:
+            if cwd is None:
+                raise ValueError("cwd is required when creating a new DSH session.")
+            resolved_cwd = Path(cwd).expanduser().resolve()
+        if not resolved_cwd.is_dir():
+            raise ValueError("DSH session cwd must be an existing directory.")
+
+        handle_id = f"deepseek-harness-handle-{uuid4()}"
+        launch_args = preflight.get("launchArgs")
+        if not isinstance(launch_args, Sequence) or isinstance(launch_args, (str, bytes)):
+            raise ValueError("DeepSeek Harness preflight launchArgs are missing.")
+        package_version = str(preflight["expectedPackageVersion"])
+        runtime_executable = str(
+            preflight.get("runtimeExecutablePath") or launch_args[0]
+        )
+        spec = build_deepseek_harness_runtime_spec(
+            workspace_id=workspace_id,
+            agent_id=visible_agent_id,
+            handle_id=handle_id,
+            dsh_session_id=dsh_session_id,
+            session_start_mode=session_start_mode,
+            session_compression=session_compression,
+            cwd=str(resolved_cwd),
+            session_root=str(
+                Path(effective_session_root).expanduser().resolve(strict=False)
+                if session_start_mode == "resume"
+                else Path(effective_session_root).expanduser().resolve(strict=False)
+                / dsh_session_id
+            ),
+            runtime_home=runtime_home,
+            runtime_home_source=runtime_home_source,
+            carrier=carrier,
+            executable_path=runtime_executable,
+            launch_args=tuple(str(item) for item in launch_args),
+            cordis_config_path=(
+                str(preflight["runtimeConfigPath"])
+                if preflight.get("runtimeConfigPath") is not None
+                else cordis_config_path
+            ),
+            package_root=package_root,
+            package_version=package_version,
+            expected_server_version=str(
+                preflight.get("expectedServerVersion") or package_version
+            ),
+            model_provider=model_provider,
+            model=model,
+            state_root=state_root,
+            reply_writeback_mode=reply_writeback_mode,
+            initialize_timeout_seconds=initialize_timeout_seconds,
+            operation_timeout_seconds=operation_timeout_seconds,
+            shutdown_timeout_seconds=shutdown_timeout_seconds,
+            max_line_bytes=max_line_bytes,
+            max_total_output_bytes=max_total_output_bytes,
+            max_stderr_bytes=max_stderr_bytes,
+        )
+        Path(spec.runtime_home).mkdir(parents=True, exist_ok=True)
+        Path(spec.session_root).mkdir(parents=True, exist_ok=True)
+        started = launch_deepseek_harness_supervisor(spec)
+        if started.get("started") is not True:
+            return {
+                "schema": "deepseek_harness_agent_join.v1",
+                "ok": False,
+                "completed": False,
+                "failedStage": "runtimeInitialize",
+                "workspaceId": workspace_id,
+                "visibleAgentId": visible_agent_id,
+                "provider": "deepseek_harness",
+                "preflight": preflight,
+                "supervisorStart": started,
+                "dispatchReady": False,
+                "platformRegistrationWritesApplied": False,
+                "ownedRuntimeArtifactsMayExist": True,
+            }
+        existing_agent = self._find_workspace_agent(
+            workspace_id=workspace_id,
+            agent_id=visible_agent_id,
+        )
+        if existing_agent is None:
+            agent_result = self.create_agent(
+                workspace_id=workspace_id,
+                agent_id=visible_agent_id,
+                name=_optional_text(agent_name) or visible_agent_id,
+                description="Beacon-owned DeepSeek Harness managed runtime Agent.",
+                metadata={
+                    "deepseekHarnessManagedRuntime": {
+                        "schema": "deepseek_harness_agent_metadata.v1",
+                        "existingSessionImport": session_start_mode == "resume",
+                        "continuityScope": "persistent_native_session",
+                    }
+                },
+            )
+            agent = agent_result["agent"]
+            agent_created = True
+        else:
+            agent = existing_agent
+            agent_created = False
+        binding = runtime_handle_metadata(spec)
+        if endpoint_to_rebind is not None:
+            self.deactivate_agent_endpoint(
+                workspace_id=workspace_id,
+                endpoint_id=str(endpoint_to_rebind["endpointId"]),
+                deactivated_by=created_by,
+                reason=(
+                    "DeepSeek Harness persistent session rebound to a new runtime "
+                    "generation"
+                ),
+            )
+        registered = self.register_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            agent_id=visible_agent_id,
+            handle_id=handle_id,
+            deepseek_harness_session_id=dsh_session_id,
+            cwd=str(resolved_cwd),
+            created_by=created_by,
+            reason=reason,
+            metadata={
+                "runtimeBinding": binding,
+                **(
+                    {"resumedFrom": dict(resumed_from)}
+                    if resumed_from is not None
+                    else {}
+                ),
+                "providerBackend": resolve_provider_backend(
+                    "deepseek_harness"
+                ).to_metadata(),
+            },
+        )
+        handle = registered["deepseekHarnessSessionHandle"]
+        endpoint = self.login_agent_endpoint(
+            workspace_id=workspace_id,
+            agent_id=visible_agent_id,
+            alias=alias,
+            provider="deepseek_harness",
+            provider_handle_id=handle_id,
+            direction="send_receive",
+            default_reply_policy="source_handle_required",
+            contact_policy="open",
+            created_by=created_by,
+            reason=reason,
+            metadata={
+                "deepseekHarnessRuntime": {
+                    "runtimeId": spec.runtime_id,
+                    "generationId": spec.generation_id,
+                    "statusAuthority": "owned_live",
+                }
+            },
+        )
+        with self._components() as components:
+            runtime_audit = components.operations().record_deepseek_harness_runtime_lifecycle(
+                workspace_id,
+                handle_id=handle_id,
+                action="initialized_and_dispatch_ready",
+                runtime_state=dict(started["runtimeState"]),
+            )
+        return {
+            "schema": "deepseek_harness_agent_join.v1",
+            "ok": True,
+            "completed": True,
+            "workspaceId": workspace_id,
+            "visibleAgentId": visible_agent_id,
+            "provider": "deepseek_harness",
+            "nativeSessionId": dsh_session_id,
+            "primaryEndpointAlias": alias,
+            "agent": agent,
+            "agentCreated": agent_created,
+            "deepseekHarnessSessionHandle": handle,
+            "agentEndpoint": endpoint["agentEndpoint"],
+            "runtime": dict(started["runtimeState"]),
+            "runtimeAudit": runtime_audit,
+            "preflight": preflight,
+            "providerBackendSelection": resolve_provider_backend(
+                "deepseek_harness"
+            ).to_metadata(),
+            "dispatchReady": True,
+            "existingSessionImport": session_start_mode == "resume",
+            "sessionStartMode": session_start_mode,
+            "sessionSelection": "exact_id" if session_id is not None else "new",
+            "databaseScanned": False,
+            "reused": False,
+            "authenticatedRealModelSmokeRun": False,
+        }
+
+    def get_deepseek_harness_runtime_status(
+        self,
+        *,
+        workspace_id: str,
+        handle_id: str,
+    ) -> Mapping[str, object]:
+        handle = self.get_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            handle_id=handle_id,
+        )["deepseekHarnessSessionHandle"]
+        binding = _deepseek_harness_handle_binding(handle)
+        try:
+            response = request_deepseek_harness_supervisor(
+                state_path=str(binding["runtimeStatePath"]),
+                token_path=str(binding["runtimeTokenPath"]),
+                method="status",
+                workspace_id=workspace_id,
+                agent_id=str(handle["agentId"]),
+                handle_id=handle_id,
+                runtime_id=str(binding["runtimeId"]),
+                generation_id=str(binding["generationId"]),
+                payload={},
+                timeout_seconds=5.0,
+            )
+        except (OSError, ValueError, DeepSeekHarnessRuntimeError) as exc:
+            response = {
+                "schema": "deepseek_harness_supervisor_response.v1",
+                "ok": False,
+                "status": "continuity_lost",
+                "failureCategory": "owned_runtime_status_unavailable",
+                "failureReason": f"{exc.__class__.__name__}: {exc}",
+                "ambiguousDelivery": False,
+            }
+        handle_transition = None
+        runtime_state = response.get("runtimeState")
+        cleanly_stopped = (
+            isinstance(runtime_state, MappingABC)
+            and runtime_state.get("lifecycle") == "stopped"
+        )
+        continuity_lost = response.get("ok") is not True and not cleanly_stopped
+        if continuity_lost and handle.get("state") == "active":
+            with self._components() as components:
+                handle_transition = components.operations().transition_deepseek_harness_session_handle(
+                    workspace_id,
+                    handle_id=handle_id,
+                    state=DeepSeekHarnessRegisteredSessionHandleState.CONTINUITY_LOST,
+                    changed_by="deepseek-harness-owned-status",
+                    reason=str(
+                        response.get("failureCategory")
+                        or "owned_runtime_status_unavailable"
+                    ),
+                )
+        return {
+            "schema": "deepseek_harness_runtime_status.v1",
+            "provider": "deepseek_harness",
+            "handle": handle,
+            "statusAuthority": "owned_live",
+            "runtimeStatus": response,
+            "handleTransition": handle_transition,
+            "continuityLost": continuity_lost,
+            "resumeRequired": response.get("ok") is not True,
+            "resumeAvailable": (
+                response.get("ok") is not True
+                and response.get("ambiguousDelivery") is not True
+            ),
+            "requiresRecreate": False,
+        }
+
+    def stop_deepseek_harness_runtime(
+        self,
+        *,
+        workspace_id: str,
+        handle_id: str,
+        acknowledge_continuity_loss: bool = False,
+        acknowledge_runtime_stop: bool = False,
+        stopped_by: str = "user",
+    ) -> Mapping[str, object]:
+        if not acknowledge_runtime_stop and not acknowledge_continuity_loss:
+            raise ValueError(
+                "DeepSeek Harness runtime stop requires explicit runtime-stop acknowledgement."
+            )
+        handle = self.get_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            handle_id=handle_id,
+        )["deepseekHarnessSessionHandle"]
+        binding = _deepseek_harness_handle_binding(handle)
+        response = request_deepseek_harness_supervisor(
+            state_path=str(binding["runtimeStatePath"]),
+            token_path=str(binding["runtimeTokenPath"]),
+            method="stop",
+            workspace_id=workspace_id,
+            agent_id=str(handle["agentId"]),
+            handle_id=handle_id,
+            runtime_id=str(binding["runtimeId"]),
+            generation_id=str(binding["generationId"]),
+            payload={"acknowledgeRuntimeStop": True},
+            timeout_seconds=15.0,
+        )
+        runtime_state = response.get("runtimeState")
+        with self._components() as components:
+            if isinstance(runtime_state, MappingABC):
+                runtime_audit = components.operations().record_deepseek_harness_runtime_lifecycle(
+                    workspace_id,
+                    handle_id=handle_id,
+                    action="explicit_stop",
+                    runtime_state=runtime_state,
+                )
+            else:
+                runtime_audit = None
+            continuity_lost = response.get("continuityLost") is True
+            transitioned = components.operations().transition_deepseek_harness_session_handle(
+                workspace_id,
+                handle_id=handle_id,
+                state=(
+                    DeepSeekHarnessRegisteredSessionHandleState.CONTINUITY_LOST
+                    if continuity_lost
+                    else DeepSeekHarnessRegisteredSessionHandleState.INACTIVE
+                ),
+                changed_by=stopped_by,
+                reason=(
+                    "active_operation_forced_termination"
+                    if continuity_lost
+                    else "clean_runtime_stop_resumable"
+                ),
+            )
+        return {
+            "schema": "deepseek_harness_runtime_stop.v1",
+            "ok": response.get("ok") is True,
+            "continuityLost": response.get("continuityLost") is True,
+            "resumeRequired": response.get("ok") is True,
+            "resumeAvailable": response.get("resumeAvailable") is True,
+            "requiresRecreate": False,
+            "supervisorResponse": response,
+            "handleTransition": transitioned,
+            "runtimeAudit": runtime_audit,
+        }
+
+    def resume_deepseek_harness_runtime(
+        self,
+        *,
+        workspace_id: str,
+        handle_id: str,
+        acknowledge_ambiguous_delivery: bool = False,
+        resumed_by: str = "user",
+    ) -> Mapping[str, object]:
+        """Start a new runtime generation on the same persisted native session."""
+
+        old_handle = self.get_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            handle_id=handle_id,
+        )["deepseekHarnessSessionHandle"]
+        if old_handle.get("state") == "active":
+            status = self.get_deepseek_harness_runtime_status(
+                workspace_id=workspace_id,
+                handle_id=handle_id,
+            )
+            runtime_status = status.get("runtimeStatus")
+            if isinstance(runtime_status, MappingABC) and runtime_status.get("ok") is True:
+                return {
+                    "schema": "deepseek_harness_runtime_resume.v1",
+                    "ok": True,
+                    "resumed": False,
+                    "reusedLiveRuntime": True,
+                    "oldHandle": old_handle,
+                    "newHandle": old_handle,
+                    "nativeSessionId": old_handle["deepseekHarnessSessionId"],
+                    "runtime": runtime_status.get("runtimeState"),
+                }
+            old_handle = self.get_deepseek_harness_session_handle(
+                workspace_id=workspace_id,
+                handle_id=handle_id,
+            )["deepseekHarnessSessionHandle"]
+        old_binding = _deepseek_harness_handle_binding(old_handle)
+        old_state = read_runtime_state(str(old_binding["runtimeStatePath"]))
+        ambiguous_delivery = old_state.get("ambiguousDelivery") is True
+        if ambiguous_delivery and not acknowledge_ambiguous_delivery:
+            raise ValueError(
+                "the previous DSH generation ended with ambiguous delivery; pass "
+                "--acknowledge-ambiguous-delivery to resume without replaying it, or "
+                "choose explicit recreate for a new session."
+            )
+        raw_spec = json.loads(
+            Path(str(old_binding["runtimeSpecPath"])).read_text(encoding="utf-8")
+        )
+        if not isinstance(raw_spec, MappingABC):
+            raise ValueError("old DeepSeek Harness runtime spec is invalid.")
+        old_spec = DeepSeekHarnessRuntimeSpec.from_mapping(raw_spec)
+        joined = self.join_deepseek_harness_agent(
+            workspace_id=workspace_id,
+            agent_id=str(old_handle["agentId"]),
+            agent_name=None,
+            cwd=old_spec.cwd,
+            carrier=old_spec.carrier,
+            executable_path=old_spec.executable_path,
+            package_root=old_spec.package_root,
+            cordis_config_path=old_spec.cordis_config_path,
+            runtime_home=old_spec.runtime_home,
+            runtime_home_source=old_spec.runtime_home_source,
+            state_root=str(Path(old_spec.paths.state_directory).parent),
+            session_root=old_spec.session_root,
+            session_id=old_spec.dsh_session_id,
+            session_compression=old_spec.session_compression,
+            model_provider=old_spec.model_provider,
+            model=old_spec.model,
+            reply_writeback_mode=old_spec.reply_writeback_mode,
+            created_by=resumed_by,
+            reason="resume persistent DeepSeek Harness session",
+            initialize_timeout_seconds=old_spec.initialize_timeout_seconds,
+            operation_timeout_seconds=old_spec.operation_timeout_seconds,
+            shutdown_timeout_seconds=old_spec.shutdown_timeout_seconds,
+            max_line_bytes=old_spec.max_line_bytes,
+            max_total_output_bytes=old_spec.max_total_output_bytes,
+            max_stderr_bytes=old_spec.max_stderr_bytes,
+            resumed_from={
+                "handleId": handle_id,
+                "runtimeId": old_binding["runtimeId"],
+                "generationId": old_binding["generationId"],
+                "deepseekHarnessSessionId": old_spec.dsh_session_id,
+                "ambiguousDeliveryAcknowledged": ambiguous_delivery,
+            },
+        )
+        return {
+            "schema": "deepseek_harness_runtime_resume.v1",
+            "ok": joined.get("ok") is True,
+            "resumed": joined.get("ok") is True,
+            "reusedLiveRuntime": False,
+            "oldHandle": old_handle,
+            "newHandle": joined.get("deepseekHarnessSessionHandle"),
+            "nativeSessionId": old_spec.dsh_session_id,
+            "sameNativeSessionId": (
+                joined.get("nativeSessionId") == old_spec.dsh_session_id
+            ),
+            "newRuntime": joined.get("runtime"),
+            "join": joined,
+            "ambiguousDeliveryAcknowledged": ambiguous_delivery,
+            "requestReplayAttempted": False,
+        }
+
+    def recreate_deepseek_harness_runtime(
+        self,
+        *,
+        workspace_id: str,
+        handle_id: str,
+        acknowledge_continuity_loss: bool,
+        recreated_by: str = "user",
+    ) -> Mapping[str, object]:
+        if not acknowledge_continuity_loss:
+            raise ValueError(
+                "DeepSeek Harness recreate requires explicit continuity-loss acknowledgement."
+            )
+        old_handle = self.get_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            handle_id=handle_id,
+        )["deepseekHarnessSessionHandle"]
+        old_binding = _deepseek_harness_handle_binding(old_handle)
+        raw_spec = json.loads(
+            Path(str(old_binding["runtimeSpecPath"])).read_text(encoding="utf-8")
+        )
+        if not isinstance(raw_spec, MappingABC):
+            raise ValueError("old DeepSeek Harness runtime spec is invalid.")
+        old_spec = DeepSeekHarnessRuntimeSpec.from_mapping(raw_spec)
+        if old_handle.get("state") == "active":
+            self.stop_deepseek_harness_runtime(
+                workspace_id=workspace_id,
+                handle_id=handle_id,
+                acknowledge_continuity_loss=True,
+                stopped_by=recreated_by,
+            )
+        endpoint = next(
+            (
+                item
+                for item in self.list_agent_endpoints(
+                    workspace_id=workspace_id,
+                    include_inactive=False,
+                )["agentEndpoints"]
+                if item.get("providerHandleId") == handle_id
+            ),
+            None,
+        )
+        if endpoint is None:
+            raise ValueError("DeepSeek Harness endpoint for old handle was not found.")
+        self.deactivate_agent_endpoint(
+            workspace_id=workspace_id,
+            endpoint_id=str(endpoint["endpointId"]),
+            deactivated_by=recreated_by,
+            reason="DeepSeek Harness runtime/session recreated",
+        )
+
+        new_handle_id = f"deepseek-harness-handle-{uuid4()}"
+        new_session_id = f"beacon-dsh-session-{uuid4()}"
+        new_spec = build_deepseek_harness_runtime_spec(
+            workspace_id=workspace_id,
+            agent_id=str(old_handle["agentId"]),
+            handle_id=new_handle_id,
+            dsh_session_id=new_session_id,
+            cwd=old_spec.cwd,
+            session_root=str(Path(old_spec.session_root).parent / new_session_id),
+            runtime_home=old_spec.runtime_home,
+            runtime_home_source=old_spec.runtime_home_source,
+            carrier=old_spec.carrier,
+            executable_path=old_spec.executable_path,
+            launch_args=old_spec.launch_args,
+            cordis_config_path=old_spec.cordis_config_path,
+            package_root=old_spec.package_root,
+            package_version=old_spec.package_version,
+            expected_server_version=old_spec.expected_server_version,
+            model_provider=old_spec.model_provider,
+            model=old_spec.model,
+            state_root=str(Path(old_spec.paths.state_directory).parent),
+            session_start_mode="create",
+            session_compression=old_spec.session_compression,
+            reply_writeback_mode=old_spec.reply_writeback_mode,
+            initialize_timeout_seconds=old_spec.initialize_timeout_seconds,
+            operation_timeout_seconds=old_spec.operation_timeout_seconds,
+            shutdown_timeout_seconds=old_spec.shutdown_timeout_seconds,
+            max_line_bytes=old_spec.max_line_bytes,
+            max_total_output_bytes=old_spec.max_total_output_bytes,
+            max_stderr_bytes=old_spec.max_stderr_bytes,
+        )
+        started = launch_deepseek_harness_supervisor(new_spec)
+        if started.get("started") is not True:
+            return {
+                "schema": "deepseek_harness_runtime_recreate.v1",
+                "ok": False,
+                "oldHandle": old_handle,
+                "oldSessionTerminal": True,
+                "newSessionId": new_session_id,
+                "newRuntimeStarted": False,
+                "supervisorStart": started,
+            }
+        registered = self.register_deepseek_harness_session_handle(
+            workspace_id=workspace_id,
+            agent_id=str(old_handle["agentId"]),
+            handle_id=new_handle_id,
+            deepseek_harness_session_id=new_session_id,
+            cwd=old_spec.cwd,
+            created_by=recreated_by,
+            reason="explicit DeepSeek Harness runtime/session recreate",
+            metadata={
+                "runtimeBinding": runtime_handle_metadata(new_spec),
+                "recreatedFrom": {
+                    "handleId": handle_id,
+                    "deepseekHarnessSessionId": old_handle.get(
+                        "deepseekHarnessSessionId"
+                    ),
+                    "runtimeId": old_binding["runtimeId"],
+                    "generationId": old_binding["generationId"],
+                },
+                "providerBackend": resolve_provider_backend(
+                    "deepseek_harness"
+                ).to_metadata(),
+            },
+        )
+        new_endpoint = self.login_agent_endpoint(
+            workspace_id=workspace_id,
+            agent_id=str(old_handle["agentId"]),
+            alias=str(endpoint["alias"]),
+            provider="deepseek_harness",
+            provider_handle_id=new_handle_id,
+            direction=str(endpoint["direction"]),
+            default_reply_policy=str(endpoint["defaultReplyPolicy"]),
+            contact_policy=str(endpoint["contactPolicy"]),
+            created_by=recreated_by,
+            reason="DeepSeek Harness runtime/session recreated",
+        )
+        with self._components() as components:
+            audit = components.operations().record_deepseek_harness_runtime_lifecycle(
+                workspace_id,
+                handle_id=new_handle_id,
+                action="recreated_new_session",
+                runtime_state=dict(started["runtimeState"]),
+            )
+        return {
+            "schema": "deepseek_harness_runtime_recreate.v1",
+            "ok": True,
+            "oldHandle": old_handle,
+            "oldSessionTerminal": True,
+            "newHandle": registered["deepseekHarnessSessionHandle"],
+            "newEndpoint": new_endpoint["agentEndpoint"],
+            "oldSessionIdReused": False,
+            "newSessionId": new_session_id,
+            "newRuntime": started["runtimeState"],
+            "runtimeAudit": audit,
+        }
+
+    def _agent_provider_onboard_binding_conflict(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        provider: str,
+        session_id: str,
+        endpoint_alias: str,
+        handle_id: str | None,
+        endpoint_id: str | None,
+        direction: str,
+        default_reply_policy: str,
+        contact_policy: str,
+        allow_shared_session_binding: bool = False,
+    ) -> Mapping[str, object] | None:
+        handles = _provider_session_handles(
+            self,
+            workspace_id=workspace_id,
+            provider=provider,
+            agent_id=None,
+        )
+        session_field = _provider_session_id_field(provider)
+        handles_by_id = {
+            str(item.get("handleId")): item
+            for item in handles
+            if item.get("handleId") is not None
+        }
+        existing_session_handle = next(
+            (
+                item
+                for item in handles
+                if item.get(session_field) == session_id
+                and item.get("state", "active") == "active"
+            ),
+            None,
+        )
+        if (
+            existing_session_handle is not None
+            and existing_session_handle.get("agentId") != agent_id
+            and not allow_shared_session_binding
+        ):
+            return {
+                "message": (
+                    "provider native session is already joined by another visible "
+                    "Agent; ordinary agent-join does not share active sessions."
+                ),
+                "providerHandle": existing_session_handle,
+                "existingVisibleAgentId": existing_session_handle.get("agentId"),
+                "writesApplied": False,
+            }
+        if handle_id is not None and handle_id in handles_by_id:
+            existing_handle = handles_by_id[handle_id]
+            if not _provider_handle_matches(
+                existing_handle,
+                agent_id=agent_id,
+                session_field=session_field,
+                session_id=session_id,
+            ):
+                return {
+                    "message": "provider session handle id is already bound differently.",
+                    "providerHandle": existing_handle,
+                    "writesApplied": False,
+                }
+
+        endpoints = self.list_agent_endpoints(
+            workspace_id=workspace_id,
+            include_inactive=False,
+        )["agentEndpoints"]
+        existing_by_id = next(
+            (
+                item
+                for item in endpoints
+                if endpoint_id is not None and item.get("endpointId") == endpoint_id
+            ),
+            None,
+        )
+        if existing_by_id is not None and existing_by_id.get("alias") != endpoint_alias:
+            return {
+                "message": "agent endpoint id is already bound differently.",
+                "agentEndpoint": existing_by_id,
+                "writesApplied": False,
+            }
+        existing_alias = next(
+            (item for item in endpoints if item.get("alias") == endpoint_alias),
+            None,
+        )
+        if existing_alias is None:
+            return None
+        existing_handle = handles_by_id.get(str(existing_alias.get("providerHandleId")))
+        expected = {
+            "agentId": agent_id,
+            "provider": provider,
+            "direction": direction,
+            "defaultReplyPolicy": default_reply_policy,
+            "contactPolicy": contact_policy,
+        }
+        mismatches = {
+            key: {"expected": value, "actual": existing_alias.get(key)}
+            for key, value in expected.items()
+            if existing_alias.get(key) != value
+        }
+        if existing_handle is None or not _provider_handle_matches(
+            existing_handle,
+            agent_id=agent_id,
+            session_field=session_field,
+            session_id=session_id,
+        ):
+            mismatches["nativeSessionId"] = {
+                "expected": session_id,
+                "actual": (
+                    existing_handle.get(session_field)
+                    if existing_handle is not None
+                    else None
+                ),
+            }
+        if mismatches:
+            return {
+                "message": "endpoint alias is already active with different binding.",
+                "agentEndpoint": existing_alias,
+                "providerHandle": existing_handle,
+                "mismatches": mismatches,
+                "writesApplied": False,
+            }
+        return None
 
     def login_agent_endpoint(
         self,
@@ -2604,11 +3832,14 @@ class LocalPlatformApplication:
         agent_id: str | None = None,
         endpoint_alias: str | None = None,
         provider: str | None = None,
+        native_session_id: str | None = None,
         read_live_runtime_status: bool | str = "auto",
     ) -> Mapping[str, object]:
         normalized_provider = normalize_agent_endpoint_provider(provider)
         if provider is not None and normalized_provider is None:
-            raise ValueError("provider must be one of: claude, codex, hermes.")
+            raise ValueError("provider must be one of: claude, codex, hermes, deepseek_harness.")
+        if native_session_id is not None and normalized_provider is None:
+            raise ValueError("--native-session-id requires --provider; native IDs are provider-scoped.")
         normalized_alias = (
             normalize_agent_endpoint_alias(endpoint_alias)
             if endpoint_alias is not None
@@ -2618,6 +3849,7 @@ class LocalPlatformApplication:
             "agentId": agent_id,
             "endpointAlias": normalized_alias,
             "provider": normalized_provider,
+            "nativeSessionId": native_session_id,
         }
         registry_resolution = _provider_session_registry_resolution_from_settings(
             self.settings
@@ -2671,6 +3903,26 @@ class LocalPlatformApplication:
                 endpoint_alias=normalized_alias,
                 provider=normalized_provider,
             )
+            if normalized_alias is not None and (endpoints or agent_id is None):
+                alias_handles = {
+                    (endpoint["provider"], endpoint["providerHandleId"])
+                    for endpoint in endpoints
+                }
+                provider_handles = [
+                    handle for handle in provider_handles
+                    if (handle["provider"], handle["handleId"]) in alias_handles
+                ]
+            if native_session_id is not None:
+                provider_handles = [
+                    handle for handle in provider_handles
+                    if handle["session"]["id"] == native_session_id
+                ]
+                matching_handles = {(h["provider"], h["handleId"]) for h in provider_handles}
+                endpoints = [e for e in endpoints
+                             if (e["provider"], e["providerHandleId"]) in matching_handles]
+            if agent_id is None and (normalized_alias is not None or native_session_id is not None or normalized_provider is not None):
+                matching_agents = {h["agentId"] for h in provider_handles}
+                agents = [a for a in agents if a["agentId"] in matching_agents]
             dispatcher_status = operations.get_agent_dispatch_daemon_status(
                 workspace_id
             )
@@ -2795,11 +4047,13 @@ class LocalPlatformApplication:
         allowed_tools: tuple[str, ...] = (),
         permission_mode: str | None = None,
         settings_path: str | None = None,
+        activation_backend: str = "cli",
+        reply_writeback_mode: str | None = None,
         dry_run: bool = True,
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
         with self._components() as components:
-            return components.operations().activate_claude_registered_session(
+            result = components.operations().activate_claude_registered_session(
                 workspace_id,
                 agent_id=agent_id,
                 handle_id=handle_id,
@@ -2815,9 +4069,24 @@ class LocalPlatformApplication:
                 allowed_tools=allowed_tools,
                 permission_mode=permission_mode,
                 settings_path=settings_path,
+                activation_backend=activation_backend,
+                reply_writeback_mode=reply_writeback_mode,
                 dry_run=dry_run,
                 timeout_seconds=timeout_seconds,
             )
+            selection = resolve_provider_backend(
+                "claude",
+                claude_activation_backend=activation_backend,
+                source=(
+                    "provider_default"
+                    if activation_backend == "cli"
+                    else "resolved_claude_control"
+                ),
+            )
+            return {
+                **dict(result),
+                "providerBackendSelection": selection.to_metadata(),
+            }
 
     def register_codex_session_handle(
         self,
@@ -2903,11 +4172,15 @@ class LocalPlatformApplication:
         approval_policy: str | None = None,
         git_repo_check_policy: str = "skip",
         git_repo_check_policy_source: str = "default",
+        activation_backend: str = "exec_resume",
+        app_server_approval_decision: str = "decline",
+        reply_writeback_mode: str = "explicit_only",
+        control_config: Mapping[str, object] | None = None,
         dry_run: bool = True,
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
         with self._components() as components:
-            return components.operations().activate_codex_registered_session(
+            result = components.operations().activate_codex_registered_session(
                 workspace_id,
                 agent_id=agent_id,
                 handle_id=handle_id,
@@ -2924,8 +4197,134 @@ class LocalPlatformApplication:
                 approval_policy=approval_policy,
                 git_repo_check_policy=git_repo_check_policy,
                 git_repo_check_policy_source=git_repo_check_policy_source,
+                activation_backend=activation_backend,
+                app_server_approval_decision=app_server_approval_decision,
+                reply_writeback_mode=reply_writeback_mode,
                 dry_run=dry_run,
                 timeout_seconds=timeout_seconds,
+            )
+            backend_source = "resolved_provider_configuration"
+            if isinstance(control_config, MappingABC):
+                activation_selection = control_config.get("activationBackend")
+                if isinstance(activation_selection, MappingABC):
+                    configured_source = activation_selection.get("source")
+                    if configured_source is not None:
+                        backend_source = str(configured_source)
+            selection = resolve_provider_backend(
+                "codex",
+                codex_activation_backend=activation_backend,
+                source=backend_source,
+            )
+            return {
+                **dict(result),
+                **(
+                    {"codexControl": dict(control_config)}
+                    if control_config is not None
+                    else {}
+                ),
+                "providerBackendSelection": selection.to_metadata(),
+            }
+
+    def get_codex_session_status(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        handle_id: str,
+        status_read_mode: str = "beacon_snapshot",
+        codex_executable: str = "codex",
+        point_read_timeout_seconds: int = 20,
+        control_config: Mapping[str, object] | None = None,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            return components.operations().get_codex_session_status(
+                workspace_id,
+                agent_id=agent_id,
+                handle_id=handle_id,
+                status_read_mode=status_read_mode,
+                codex_executable=codex_executable,
+                point_read_timeout_seconds=point_read_timeout_seconds,
+                control_config=control_config,
+            )
+
+    def submit_codex_session_supplement(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        handle_id: str,
+        message: str,
+        expected_turn_id: str,
+        submitted_by: str,
+        supplement_id: str | None = None,
+        supplement_mode: str = "turn_steer",
+        wait_once: bool = False,
+        wait_timeout_seconds: float = 5.0,
+        control_config: Mapping[str, object] | None = None,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            return components.operations().submit_codex_session_supplement(
+                workspace_id,
+                agent_id=agent_id,
+                handle_id=handle_id,
+                message=message,
+                expected_turn_id=expected_turn_id,
+                submitted_by=submitted_by,
+                supplement_id=supplement_id,
+                supplement_mode=supplement_mode,
+                wait_once=wait_once,
+                wait_timeout_seconds=wait_timeout_seconds,
+                control_config=control_config,
+            )
+
+    def register_deepseek_harness_session_handle(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str,
+        deepseek_harness_session_id: str,
+        cwd: str,
+        created_by: str,
+        reason: str,
+        handle_id: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            return components.operations().register_deepseek_harness_session_handle(
+                workspace_id,
+                agent_id=agent_id,
+                handle_id=handle_id,
+                deepseek_harness_session_id=deepseek_harness_session_id,
+                cwd=cwd,
+                created_by=created_by,
+                reason=reason,
+                metadata=metadata,
+            )
+
+    def list_deepseek_harness_session_handles(
+        self,
+        *,
+        workspace_id: str,
+        agent_id: str | None = None,
+        include_inactive: bool = False,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            return components.operations().list_deepseek_harness_session_handles(
+                workspace_id,
+                agent_id=agent_id,
+                include_inactive=include_inactive,
+            )
+
+    def get_deepseek_harness_session_handle(
+        self,
+        *,
+        workspace_id: str,
+        handle_id: str,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            return components.operations().get_deepseek_harness_session_handle(
+                workspace_id,
+                handle_id=handle_id,
             )
 
     def register_hermes_session_handle(
@@ -3006,6 +4405,9 @@ class LocalPlatformApplication:
         handoff_directory: str | None = None,
         hermes_executable: str = "hermes",
         hermes_home: str | None = None,
+        activation_backend: str = "cli",
+        reply_writeback_mode: str | None = None,
+        gateway_python: str | None = None,
         platform_workspace_root: str | None = None,
         source_tag: str = "agent-os",
         max_turns: int | None = None,
@@ -3013,7 +4415,7 @@ class LocalPlatformApplication:
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
         with self._components() as components:
-            return components.operations().activate_hermes_registered_session(
+            result = components.operations().activate_hermes_registered_session(
                 workspace_id,
                 agent_id=agent_id,
                 handle_id=handle_id,
@@ -3024,12 +4426,28 @@ class LocalPlatformApplication:
                 handoff_directory=handoff_directory,
                 hermes_executable=hermes_executable,
                 hermes_home=hermes_home,
+                activation_backend=activation_backend,
+                reply_writeback_mode=reply_writeback_mode,
+                gateway_python=gateway_python,
                 platform_workspace_root=platform_workspace_root,
                 source_tag=source_tag,
                 max_turns=max_turns,
                 dry_run=dry_run,
                 timeout_seconds=timeout_seconds,
             )
+            selection = resolve_provider_backend(
+                "hermes",
+                hermes_activation_backend=activation_backend,
+                source=(
+                    "provider_default"
+                    if activation_backend == "cli"
+                    else "resolved_hermes_control"
+                ),
+            )
+            return {
+                **dict(result),
+                "providerBackendSelection": selection.to_metadata(),
+            }
 
     def agent_activation_instructions(
         self,
@@ -3464,10 +4882,20 @@ def _optional_text(value: object) -> str | None:
     return stripped or None
 
 
+def _required_visible_agent_id(value: object) -> str:
+    resolved = _optional_text(value)
+    if resolved is None:
+        raise ValueError("visibleAgentId must be a non-empty string.")
+    return resolved
+
+
 def _agent_dispatch_send_metadata(
     metadata: Mapping[str, object] | None,
     *,
     delivery_mode: str,
+    delivery_mode_source: str,
+    immediate_busy_policy: str,
+    immediate_busy_policy_source: str,
     message_input_provided: bool = False,
     endpoint_alias_resolution: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
@@ -3478,6 +4906,9 @@ def _agent_dispatch_send_metadata(
             "apiLayer": "delivery-oriented",
             "highLevelDispatchApi": True,
             "deliveryMode": delivery_mode,
+            "deliveryModeSource": delivery_mode_source,
+            "immediateBusyPolicy": immediate_busy_policy,
+            "immediateBusyPolicySource": immediate_busy_policy_source,
             "messageInputProvided": message_input_provided,
             "workerRunRequested": delivery_mode in (
                 "worker_dry_run",
@@ -3489,7 +4920,15 @@ def _agent_dispatch_send_metadata(
     }
 
 
-def _agent_dispatch_api_layer(delivery_mode: str) -> Mapping[str, object]:
+def _agent_dispatch_api_layer(
+    delivery_mode: str,
+    *,
+    dry_run: bool = False,
+) -> Mapping[str, object]:
+    semantic_mapping = effective_agent_dispatch_semantic_mapping(
+        delivery_mode,
+        dry_run=dry_run,
+    )
     return {
         "schema": "agent_dispatch_api_layer.v1",
         "apiLayer": "delivery-oriented",
@@ -3498,6 +4937,8 @@ def _agent_dispatch_api_layer(delivery_mode: str) -> Mapping[str, object]:
         "queuesDispatch": True,
         "canAttemptDelivery": delivery_mode in ("worker_dry_run", "worker_execute"),
         "deliveryMode": delivery_mode,
+        "semanticMapping": semantic_mapping.to_metadata(),
+        "deliveryType": "new_turn",
         "meaning": (
             "agent-dispatch-send/create is the delivery-oriented API. It may "
             "create exchange-request state and a dispatch queue entry, then "
@@ -3506,16 +4947,312 @@ def _agent_dispatch_api_layer(delivery_mode: str) -> Mapping[str, object]:
     }
 
 
-def _agent_dispatch_send_mode_summary(delivery_mode: str) -> Mapping[str, object]:
+def _agent_dispatch_send_mode_summary(
+    delivery_mode: str,
+    *,
+    dry_run: bool = False,
+) -> Mapping[str, object]:
+    semantic_mapping = effective_agent_dispatch_semantic_mapping(
+        delivery_mode,
+        dry_run=dry_run,
+    )
     return {
         "schema": "agent_dispatch_send_mode_summary.v1",
         "deliveryMode": delivery_mode,
+        "externalOperation": semantic_mapping.external_operation.value,
+        "executionStrategy": semantic_mapping.execution_strategy.value,
+        "legacyDeliveryMode": semantic_mapping.legacy_delivery_mode,
+        "deliveryType": "new_turn",
         "waitMode": "once" if delivery_mode == "worker_execute" else "none",
         "senderCanExitAfterQueue": delivery_mode == "queued",
         "workerRunRequested": delivery_mode in ("worker_dry_run", "worker_execute"),
         "workerExecuteRequested": delivery_mode == "worker_execute",
         "deliveryAttemptBounded": delivery_mode in ("worker_dry_run", "worker_execute"),
     }
+
+
+def _agent_dispatch_delivery_decision(
+    *,
+    delivery_mode: str,
+    delivery_mode_source: str,
+    immediate_busy_policy: str,
+    immediate_busy_policy_source: str,
+    dry_run: bool,
+    worker_run: Mapping[str, object] | None,
+    status: Mapping[str, object] | None,
+    target_provider: str | None,
+) -> Mapping[str, object]:
+    semantic_mapping = effective_agent_dispatch_semantic_mapping(
+        delivery_mode,
+        dry_run=dry_run,
+    )
+    immediate_attempt = delivery_mode in {"worker_dry_run", "worker_execute"}
+    item = _first_mapping_item(worker_run, "agentDispatches")
+    provider_status = (
+        item.get("providerRuntimeStatus")
+        if isinstance(item, MappingABC)
+        and isinstance(item.get("providerRuntimeStatus"), MappingABC)
+        else None
+    )
+    target_state = (
+        str(provider_status.get("runtimeState"))
+        if isinstance(provider_status, MappingABC)
+        and provider_status.get("runtimeState") is not None
+        else "not_checked" if delivery_mode == "queued" else "unknown"
+    )
+    target_state_source = (
+        str(provider_status.get("stateSource"))
+        if isinstance(provider_status, MappingABC)
+        and provider_status.get("stateSource") is not None
+        else "not_checked" if delivery_mode == "queued" else "unknown"
+    )
+    dispatch = (
+        status.get("agentDispatch")
+        if isinstance(status, MappingABC)
+        and isinstance(status.get("agentDispatch"), MappingABC)
+        else None
+    )
+    request = (
+        status.get("agentExchangeRequest")
+        if isinstance(status, MappingABC)
+        and isinstance(status.get("agentExchangeRequest"), MappingABC)
+        else None
+    )
+    dispatch_status = (
+        str(dispatch.get("status"))
+        if isinstance(dispatch, MappingABC) and dispatch.get("status") is not None
+        else None
+    )
+    effective_dispatch_status = (
+        str(status.get("effectiveDispatchStatus"))
+        if isinstance(status, MappingABC)
+        and status.get("effectiveDispatchStatus") is not None
+        else dispatch_status
+    )
+    failure_category = (
+        str(item.get("failureCategory"))
+        if isinstance(item, MappingABC) and item.get("failureCategory") is not None
+        else None
+    )
+    provider_failure_category = _nested_text(
+        item,
+        ("providerFailureCategory",),
+        ("activation", "failureCategory"),
+        ("activation", "providerFailureCategory"),
+    )
+    busy_categories = {
+        "target_busy_requires_sender_decision",
+        "codex_target_busy_rejected_by_policy",
+        "app_server_thread_busy",
+        "target_runtime_busy",
+        "target_runtime_blocked",
+    }
+    busy_returned = (
+        failure_category in busy_categories
+        or provider_failure_category in busy_categories
+    )
+    response_available = bool(
+        isinstance(request, MappingABC)
+        and (
+            request.get("responseSummary") is not None
+            or request.get("response") is not None
+        )
+    )
+    terminal_unprocessed = effective_dispatch_status == "terminal_unprocessed"
+    completion_observed = (
+        effective_dispatch_status == "completed" or response_available
+    )
+    if dry_run:
+        outcome = "unknown"
+    elif terminal_unprocessed:
+        outcome = "terminal_unprocessed"
+    elif delivery_mode == "queued":
+        outcome = "queued"
+    elif busy_returned:
+        outcome = "busy_returned"
+    elif completion_observed:
+        outcome = "completed"
+    elif effective_dispatch_status in {"failed", "cancelled"}:
+        outcome = "failed"
+    else:
+        outcome = "unknown"
+
+    can_steer = bool(
+        isinstance(provider_status, MappingABC)
+        and (
+            provider_status.get("canSteer") is True
+            or _nested_bool(provider_status, "canSteer")
+        )
+    )
+    available_actions: list[str] = []
+    guidance: str
+    if busy_returned:
+        if (target_provider or "").strip().lower() == "codex" and can_steer:
+            available_actions.append("supplement_active_turn")
+        available_actions.extend(("queue_next_turn", "cancel"))
+        guidance = (
+            "Target is busy. The caller must explicitly choose whether to "
+            "supplement an owned active Codex turn when offered, create a queued "
+            "next-turn dispatch, or cancel."
+        )
+    elif outcome == "terminal_unprocessed":
+        guidance = (
+            "The linked request was already terminal before provider delivery. "
+            "The append-only raw dispatch remains available for audit and will "
+            "not be selected by a worker."
+        )
+    elif outcome == "queued":
+        available_actions.append("inspect_queue_status")
+        guidance = (
+            "Dispatch was stored for an explicitly selected asynchronous worker "
+            "or daemon path; Beacon did not start or verify a provider command."
+        )
+    elif outcome == "completed":
+        available_actions.append("read_response")
+        guidance = "The bounded delivery completed; read the recorded response."
+    elif dry_run:
+        available_actions.append("execute_planned_delivery")
+        guidance = "Dry-run only: no dispatch state or provider command was created."
+    else:
+        available_actions.extend(("inspect_status", "cancel"))
+        guidance = "Inspect the returned dispatch and provider failure details."
+
+    provider_command_started = bool(
+        _nested_bool(item, "providerCommandStarted")
+        or _nested_bool(worker_run, "providerCommandStarted")
+    )
+    delivery_attempted = bool(
+        immediate_attempt
+        and not dry_run
+        and isinstance(worker_run, MappingABC)
+        and worker_run.get("workerStarted") is True
+        and isinstance(item, MappingABC)
+        and not bool(item.get("skipped"))
+    )
+    activation_status = _nested_text(item, ("activation", "status"))
+    native_turn_status = _nested_text(
+        item,
+        ("activation", "nativeTurnStatus"),
+    )
+    execution_completed = bool(
+        completion_observed
+        or activation_status in {"delivered", "completed"}
+        or native_turn_status in {"completed", "succeeded"}
+    )
+    if dry_run:
+        delivery_state = "unknown"
+        execution_state = "not_started"
+    elif terminal_unprocessed:
+        delivery_state = "not_delivered"
+        execution_state = "not_started"
+    elif delivery_mode == "queued":
+        delivery_state = "queued"
+        execution_state = "not_started"
+    elif busy_returned:
+        delivery_state = "rejected"
+        execution_state = "not_started"
+    elif effective_dispatch_status in {"failed", "cancelled"}:
+        delivery_state = "failed"
+        execution_state = "failed"
+    elif execution_completed:
+        delivery_state = "accepted"
+        execution_state = "completed"
+    elif provider_command_started:
+        delivery_state = "unknown"
+        execution_state = "active"
+    else:
+        delivery_state = "unknown"
+        execution_state = "unknown"
+    reply_state = "recorded" if response_available else "none"
+    state_projection = {
+        "schema": "agent_dispatch_state_projection.v1",
+        "deliveryState": delivery_state,
+        "executionState": execution_state,
+        "replyState": reply_state,
+        "replyExpectation": "unspecified",
+    }
+    return {
+        "schema": "agent_dispatch_delivery_decision.v1",
+        "externalOperation": semantic_mapping.external_operation.value,
+        "executionStrategy": semantic_mapping.execution_strategy.value,
+        "legacyDeliveryMode": semantic_mapping.legacy_delivery_mode,
+        "semanticMapping": semantic_mapping.to_metadata(),
+        "stateProjection": state_projection,
+        "deliveryState": delivery_state,
+        "executionState": execution_state,
+        "replyState": reply_state,
+        "replyExpectation": "unspecified",
+        "requestedMode": delivery_mode,
+        "effectiveMode": delivery_mode,
+        "modeSource": delivery_mode_source,
+        "immediateBusyPolicy": immediate_busy_policy,
+        "immediateBusyPolicySource": immediate_busy_policy_source,
+        "immediateAttempt": immediate_attempt,
+        "targetStateBeforeAttempt": target_state,
+        "targetStateSource": target_state_source,
+        "deliveryAttempted": delivery_attempted,
+        "providerCommandStarted": provider_command_started,
+        "deliveryAccepted": bool(
+            not terminal_unprocessed
+            and (provider_command_started or completion_observed)
+        ),
+        "completionObserved": completion_observed,
+        "responseAvailable": response_available,
+        "outcome": outcome,
+        "busyDecisionRequired": busy_returned,
+        "normalizedFailureCategory": (
+            "target_busy_requires_sender_decision"
+            if busy_returned
+            else failure_category
+        ),
+        "providerFailureCategory": provider_failure_category,
+        "availableActions": available_actions,
+        "guidance": guidance,
+        "requiresUserReview": bool(
+            isinstance(request, MappingABC)
+            and request.get("requiresUserReview") is True
+        ),
+    }
+
+
+def _first_mapping_item(
+    value: Mapping[str, object] | None,
+    key: str,
+) -> Mapping[str, object] | None:
+    if not isinstance(value, MappingABC):
+        return None
+    items = value.get(key)
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        return None
+    return items[0] if items and isinstance(items[0], MappingABC) else None
+
+
+def _nested_bool(value: object, key: str) -> bool:
+    if isinstance(value, MappingABC):
+        if value.get(key) is True:
+            return True
+        return any(_nested_bool(item, key) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_nested_bool(item, key) for item in value)
+    return False
+
+
+def _nested_text(
+    value: Mapping[str, object] | None,
+    *paths: tuple[str, ...],
+) -> str | None:
+    for path in paths:
+        current: object = value
+        for key in path:
+            if not isinstance(current, MappingABC):
+                current = None
+                break
+            current = current.get(key)
+        if current is not None:
+            text = str(current).strip()
+            if text:
+                return text
+    return None
 
 
 def _agent_onboarding_status_payload(
@@ -3554,6 +5291,9 @@ def _agent_onboarding_status_payload(
         endpoints=endpoints,
         missing=missing,
     )
+    if filters.get("nativeSessionId") is not None and len(provider_handles) != 1:
+        dispatch_readiness = {**dispatch_readiness, "ready": False,
+                              "reason": "native_session_missing_or_ambiguous"}
     next_action = _agent_onboarding_next_action(missing, dispatch_readiness)
     next_actions = _agent_onboarding_next_actions(
         missing=missing,
@@ -3586,6 +5326,18 @@ def _agent_onboarding_status_payload(
             "rootPath": workspace.get("rootPath") if workspace is not None else None,
         },
         "filters": dict(filters),
+        "nativeSessionResolution": {
+            "status": (
+                "not_requested" if filters.get("nativeSessionId") is None else
+                "missing" if not provider_handles else
+                "ambiguous" if len(provider_handles) > 1 else
+                "matched" if provider_handles[0].get("active") else "inactive"
+            ),
+            "matchCount": len(provider_handles) if filters.get("nativeSessionId") is not None else None,
+            "scope": "registered_workspace_handles",
+            "externalDiscoveryPerformed": False,
+            "runtimeStarted": False,
+        },
         "agents": {
             "schema": "agent_onboarding_agents.v1",
             "count": len(agents),
@@ -3821,6 +5573,14 @@ def _agent_onboarding_provider_handles(
                 include_inactive=True,
             )["hermesSessionHandles"]
         )
+    if provider in (None, "deepseek_harness"):
+        handles.extend(
+            _agent_onboarding_handle_item("deepseek_harness", handle)
+            for handle in operations.list_deepseek_harness_session_handles(
+                workspace_id,
+                include_inactive=True,
+            )["deepseekHarnessSessionHandles"]
+        )
     return [
         handle
         for handle in sorted(
@@ -3864,6 +5624,7 @@ def _agent_onboarding_handle_item(
         "providerKind": handle.get("provider"),
         "handleId": handle.get("handleId"),
         "agentId": handle.get("agentId"),
+        "nativeSessionId": session_id,
         "active": state == "active",
         "state": state,
         "session": {
@@ -3955,6 +5716,7 @@ def _agent_onboarding_endpoint_item(
         and agent_matches
         and provider_matches
         and direction in {"receive_only", "send_receive"}
+        and endpoint.get("contactPolicy") != "block_all"
     )
     reasons: list[str] = []
     if not endpoint_active:
@@ -3969,6 +5731,8 @@ def _agent_onboarding_endpoint_item(
         reasons.append("provider_filter_mismatch")
     if direction not in {"receive_only", "send_receive"}:
         reasons.append("endpoint_not_receive_capable")
+    if endpoint.get("contactPolicy") == "block_all":
+        reasons.append("contact_policy_blocks_all")
     return {
         "schema": "agent_endpoint_inventory_item.v1",
         "endpointId": endpoint.get("endpointId"),
@@ -3998,7 +5762,7 @@ def _agent_onboarding_handle_inventory(
     handles: Sequence[Mapping[str, object]],
 ) -> Mapping[str, object]:
     by_provider = []
-    for provider in ("claude", "codex", "hermes"):
+    for provider in ("claude", "codex", "hermes", "deepseek_harness"):
         provider_handles = [
             handle for handle in handles if handle.get("provider") == provider
         ]
@@ -4146,11 +5910,11 @@ def _agent_onboarding_next_action(
     if "workspace" in missing:
         return "create_or_open_workspace"
     if "agent" in missing:
-        return "create_or_onboard_agent"
+        return "join_agent"
     if "session_handle" in missing:
-        return "discover_or_register_provider_session"
+        return "join_agent_session"
     if "endpoint_alias" in missing:
-        return "login_endpoint_alias"
+        return "join_agent_endpoint"
     if "dispatch_readiness" in missing:
         return "fix_endpoint_or_provider_handle"
     if dispatch_readiness.get("ready"):
@@ -4181,19 +5945,15 @@ def _agent_onboarding_next_actions(
         ]
     if "agent" in missing:
         return [
-            action("onboard_provider", "workspace agent is missing", "providerOnboard"),
-            action("create_agent", "create only the agent identity", "agentCreate"),
+            action("join_agent", "workspace agent is missing", "agentJoin"),
         ]
     if "session_handle" in missing:
         return [
-            action("onboard_provider", "provider session handle is missing", "providerOnboard"),
-            action("discover_session", "find registration-ready session metadata", "sessionDiscover"),
-            action("register_handle", "register a discovered session handle", "registerDiscoveredHandle"),
+            action("join_agent", "provider session handle is missing", "agentJoin"),
         ]
     if "endpoint_alias" in missing:
         return [
-            action("onboard_provider", "endpoint alias is missing", "providerOnboard"),
-            action("endpoint_login", "bind alias to an active provider handle", "endpointLogin"),
+            action("join_agent", "endpoint alias is missing", "agentJoin"),
         ]
     if "dispatch_readiness" in missing:
         return [
@@ -4202,9 +5962,8 @@ def _agent_onboarding_next_actions(
         ]
     if dispatch_readiness.get("ready"):
         return [
-            action("dispatch_queued", "alias is ready as a dispatch target", "dispatchQueuedExample"),
-            action("start_daemon", "queued sends need a poller for automatic delivery", "daemonStart"),
-            action("worker_execute", "attempt one bounded delivery now", "dispatchWorkerExecuteExample"),
+            action("send", "alias is ready as a dispatch target", "dispatchSendExample"),
+            action("dispatch_queued", "advanced queue requires a worker or daemon", "dispatchQueuedExample"),
         ]
     return [action("inspect_status", "no actionable readiness state found", "onboardingStatus")]
 
@@ -4229,7 +5988,7 @@ def _agent_onboarding_commands(
         "-3",
         "-m",
         "agent_os.local_runtime",
-        "local-runtime-profile-init",
+        "agent-workspace-init",
         "--project-root",
         "<project-root>",
         "--workspace-id",
@@ -4262,6 +6021,20 @@ def _agent_onboarding_commands(
     ]
     commands = {
         "profileInit": profile_init_argv,
+        "agentJoin": [
+            *base,
+            "agent-join",
+            "--workspace-id",
+            workspace_id,
+            "--agent",
+            agent_arg,
+            "--provider",
+            provider_arg,
+            "--session",
+            "<native-session-id>",
+            "--cwd",
+            "<project-cwd>",
+        ],
         "workspaceCreate": [
             *base,
             "workspace-create",
@@ -4355,7 +6128,7 @@ def _agent_onboarding_commands(
             "<message>",
             "--queued",
         ],
-        "dispatchWorkerExecuteExample": [
+        "dispatchSendExample": [
             *base,
             "agent-dispatch-send",
             "--workspace-id",
@@ -4366,8 +6139,6 @@ def _agent_onboarding_commands(
             alias_arg,
             "--message",
             "<message>",
-            "--delivery-mode",
-            "worker_execute",
         ],
         "daemonStart": [
             *base,
@@ -4391,6 +6162,28 @@ def _agent_onboarding_commands(
             "onboarding",
         ],
     }
+    if provider == "deepseek_harness":
+        join = commands["agentJoin"]
+        index = join.index("--session")
+        join[index:index + 2] = ["--new-session"]
+        # Discovery/profile import are not DSH capabilities. Do not offer
+        # syntactically invalid or capability-expanding repair commands.
+        for key in ("sessionDiscover", "registerDiscoveredHandle", "providerOnboard"):
+            commands.pop(key)
+        invocation, environment = build_beacon_cli_invocation(
+            database_path=settings.database, workspace_root=settings.workspace_root,
+            plugins_directory=settings.plugins_directory, profile_path=settings.profile_path,
+        )
+        rendered = {}
+        for key, argv in commands.items():
+            if argv[:len(base)] == base:
+                argv = [*invocation, *argv[len(base):]]
+            else:
+                argv = [*invocation[:3], *argv[4:]]
+            examples = cli_shell_examples({"runtimeEnvironment": environment, "commandArgv": argv})["commandArgv"]
+            rendered[key] = {"argv": argv, "runtimeEnvironment": environment,
+                             "command": examples["powershell"], "shellExamples": examples}
+        return rendered
     return {
         key: {
             "argv": argv,
@@ -4469,14 +6262,14 @@ def _agent_dispatch_target_handoff(
     ]
     respond_argv_template = [
         *base,
-        "agent-exchange-request-respond",
+        "agent-reply",
         "--workspace-id",
         workspace_id,
-        "--exchange-request-id",
+        "--request",
         exchange_request_id,
-        "--responding-agent-id",
+        "--agent",
         target_agent_id,
-        "--response-summary",
+        "--message",
         "<short target-agent response>",
     ]
     return {
@@ -4652,6 +6445,7 @@ def _provider_session_id_field(provider: str) -> str:
         "claude": "claudeSessionUuid",
         "codex": "codexSessionId",
         "hermes": "hermesSessionId",
+        "deepseek_harness": "deepseekHarnessSessionId",
     }[provider]
 
 
@@ -4686,7 +6480,17 @@ def _provider_session_handles(
                 agent_id=agent_id,
             )["hermesSessionHandles"]
         ]
-    raise ValueError("provider must be one of: claude, codex, hermes.")
+    if provider == "deepseek_harness":
+        return [
+            dict(handle)
+            for handle in application.list_deepseek_harness_session_handles(
+                workspace_id=workspace_id,
+                agent_id=agent_id,
+            )["deepseekHarnessSessionHandles"]
+        ]
+    raise ValueError(
+        "provider must be one of: claude, codex, hermes, deepseek_harness."
+    )
 
 
 def _provider_handle_matches(
@@ -5251,14 +7055,39 @@ def _registered_provider_handle_metadata(
         "claude": "claudeSessionHandle",
         "codex": "codexSessionHandle",
         "hermes": "hermesSessionHandle",
+        "deepseek_harness": "deepseekHarnessSessionHandle",
     }
     key = key_by_provider.get(provider)
     if key is None:
-        raise ValueError("provider must be one of: claude, codex, hermes.")
+        raise ValueError(
+            "provider must be one of: claude, codex, hermes, deepseek_harness."
+        )
     handle = registered.get(key)
     if not isinstance(handle, MappingABC):
         raise ValueError("registered provider handle is missing.")
     return dict(handle)
+
+
+def _deepseek_harness_handle_binding(
+    handle: Mapping[str, object],
+) -> Mapping[str, object]:
+    metadata = handle.get("metadata")
+    binding = metadata.get("runtimeBinding") if isinstance(metadata, MappingABC) else None
+    if not isinstance(binding, MappingABC):
+        raise ValueError("DeepSeek Harness runtime binding is missing.")
+    for key in (
+        "runtimeId",
+        "generationId",
+        "runtimeStatePath",
+        "runtimeTokenPath",
+        "runtimeSpecPath",
+    ):
+        value = binding.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"DeepSeek Harness runtime binding {key} is missing.")
+    if binding.get("dshSessionId") != handle.get("deepseekHarnessSessionId"):
+        raise ValueError("DeepSeek Harness runtime/session identity mismatch.")
+    return dict(binding)
 
 
 def _endpoint_reference(
