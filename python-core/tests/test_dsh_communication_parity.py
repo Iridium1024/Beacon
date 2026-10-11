@@ -269,7 +269,7 @@ class DshCommunicationParityTests(unittest.TestCase):
         self.assertFalse(sent["workerRun"]["agentDispatches"][0]["activation"]["targetResponseCompleted"])
 
     def test_shell_examples_execute_literal_unicode_paths_and_reply_text(self):
-        shells = [("powershell", shutil.which("powershell")),
+        shells = [("powershell", shutil.which("powershell") or shutil.which("pwsh")),
                   ("bash", shutil.which("bash") or ("C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else None))]
         for shell, executable in shells:
             if not executable or not Path(executable).is_file():
