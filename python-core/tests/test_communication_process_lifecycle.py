@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest.mock import patch
 
 from agent_os.application.services.communication_runtime import CommunicationSupervisor, RuntimeConfig
 from agent_os.domain.entities.communication import Caller, Claim, StaleAttempt
@@ -35,6 +36,10 @@ class FixtureProcess(SubprocessActivation):
 class CommunicationProcessLifecycleTests(unittest.TestCase):
     def setUp(self):
         fixtures.CommunicationRuntimeIntegrationTests.setUp(self)
+        # Discovery changes sys.path only; all fixture children also need it.
+        child_environment = patch.dict(os.environ, {'PYTHONPATH': self.env['PYTHONPATH']})
+        child_environment.start()
+        self.addCleanup(child_environment.stop)
         self.settings = LocalPlatformSettings(database=str(self.path), workspace_root=self.temp.name,
             plugins_directory=self.temp.name, profile_path=str(self.profile), initialize_schema=False)
         self.context = prepared_runtime(self.settings, 'w')

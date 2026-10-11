@@ -19,8 +19,8 @@ from agent_os.application.services.agent_communication_context import build_agen
 from agent_os.application.services.project_workspace_scope import project_workspace_marker_payload, write_project_workspace_marker_atomic
 from agent_os.infrastructure.config import LocalPlatformSettings
 from agent_os.local_runtime import _build_parser, _agent_help
-from tests import test_deepseek_harness_application as dsh_fixture
-from tests.test_deepseek_harness_application import PREFLIGHT_TARGET, FIXTURE
+import test_deepseek_harness_application as dsh_fixture
+from test_deepseek_harness_application import PREFLIGHT_TARGET, FIXTURE
 
 FAKE_AGENT = Path(__file__).parent / "fixtures" / "fake_communication_agent.py"
 SOURCE = str(Path(__file__).resolve().parents[1] / "src")

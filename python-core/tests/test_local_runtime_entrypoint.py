@@ -3168,7 +3168,7 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
             self.assertEqual(ticket["schema"], "agent_wake_ticket.v2")
             action = ticket["recommendedAction"]
             self.assertEqual(action["runtimeConfigSource"], "explicit_args")
-            self.assertEqual(action["inspectArgv"][0], sys.executable)
+            self.assertEqual(Path(action["inspectArgv"][0]).resolve(), Path(sys.executable).resolve())
             self.assertEqual(
                 action["inspectArgv"][1:3],
                 ["-m", "agent_os.local_runtime"],
@@ -4633,6 +4633,7 @@ def _run_cli(
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=90,
     )
 
 
@@ -4660,6 +4661,7 @@ def _run_cli_without_runtime_args(
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=90,
     )
 
 

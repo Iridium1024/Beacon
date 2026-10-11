@@ -2032,6 +2032,11 @@ def _lost_runtime_response(
 
 def _detach_popen_handle(process: subprocess.Popen[object]) -> None:
     """Release only the launcher's OS handle; the detached child keeps running."""
+    if os.name != "nt":
+        # POSIX still requires the parent to reap its detached child on exit.
+        # A daemon waiter neither blocks the launcher nor terminates the child.
+        threading.Thread(target=process.wait, name="beacon-dsh-reaper", daemon=True).start()
+        return
     handle = getattr(process, "_handle", None)
     if handle is not None:
         try:

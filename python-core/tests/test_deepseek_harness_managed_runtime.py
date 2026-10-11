@@ -25,6 +25,7 @@ from agent_os.application.services.deepseek_harness_managed_runtime import (
     request_deepseek_harness_supervisor,
     runtime_handle_metadata,
     write_runtime_bootstrap,
+    _detach_popen_handle,
 )
 
 
@@ -32,6 +33,32 @@ FIXTURE = Path(__file__).parent / "fixtures" / "fake_deepseek_harness_runtime.py
 
 
 class DeepSeekHarnessManagedRuntimeTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX child reaping")
+    def test_detached_child_runs_until_released_and_is_reaped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gate = Path(directory) / "exit-gate"
+            child = subprocess.Popen([
+                sys.executable, "-c",
+                "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                "exec('while not p.exists(): time.sleep(0.01)'); sys.exit(7)",
+                str(gate),
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                _detach_popen_handle(child)
+                time.sleep(0.05)
+                self.assertIsNone(child.returncode)
+                gate.touch()
+                deadline = time.monotonic() + 5
+                while child.returncode is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(child.returncode, 7)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(child.pid, os.WNOHANG)
+            finally:
+                if child.returncode is None:
+                    child.kill()
+                child.wait(timeout=5)
+
     def test_session_owner_key_uses_platform_canonical_path_case(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
