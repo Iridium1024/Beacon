@@ -91,6 +91,62 @@ class DshCommunicationParityTests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return json.loads(result.stdout) if expected == 0 else result
 
+    def test_core_worker_executes_owned_fake_dsh_and_records_final(self):
+        backup = self.root / "pre-core-backup.sqlite3"
+        migrated = self.cli("communication-migrate", "--workspace-id", WORKSPACE,
+            "--operator", "fixture", "--backup-path", str(backup),
+            "--confirm-stopped-writers")
+        self.assertEqual(migrated["postMigrationPreview"]["engine"], "core")
+        handle, trace = self.join(policy="reply")
+        sent = self.cli("agent-dispatch-send", "--workspace-id", WORKSPACE,
+            "--from", "codex-peer", "--to", "target-dsh",
+            "--message", "synthetic core DSH request", "--queued")
+        run = self.cli("agent-dispatch-worker-run-once", "--workspace-id", WORKSPACE,
+            "--dispatch-id", sent["agentDispatch"]["dispatchId"],
+            "--execute", "--runtime-status-policy", "enabled")
+        self.assertEqual(run["engine"], "core")
+        self.assertEqual(run["processedCount"], 1)
+        status = self.cli("agent-message-status", "--workspace-id", WORKSPACE,
+            "--agent-id", "codex-peer", "--message-id", sent["agentDispatch"]["messageId"])
+        self.assertEqual(status["reply"], "final", {"run": run, "status": status})
+        self.assertTrue(trace.is_file())
+
+    def test_core_fake_dsh_no_reply_then_independent_cli_ack_progress_final(self):
+        self.cli("communication-migrate", "--workspace-id", WORKSPACE,
+            "--operator", "fixture", "--backup-path", str(self.root / "silent-backup.sqlite3"),
+            "--confirm-stopped-writers")
+        _, trace = self.join(policy="silent")
+        sent = self.cli("agent-dispatch-send", "--workspace-id", WORKSPACE,
+            "--from", "codex-peer", "--to", "target-dsh",
+            "--message", "synthetic DSH explicit receiver", "--queued")
+        message_id = sent["agentDispatch"]["messageId"]
+        run = self.cli("agent-dispatch-worker-run-once", "--workspace-id", WORKSPACE,
+            "--dispatch-id", sent["agentDispatch"]["dispatchId"],
+            "--execute", "--runtime-status-policy", "enabled")
+        self.assertEqual(run["processedCount"], 1, run)
+        self.assertTrue(trace.is_file())
+        before = self.cli("agent-message-status", "--workspace-id", WORKSPACE,
+            "--agent-id", "codex-peer", "--message-id", message_id)
+        self.assertEqual(before["reply"], "none")
+        self.assertEqual(before["delivery"]["execution"], "finished")
+        self.cli("agent-message-ack", "--workspace-id", WORKSPACE,
+            "--agent-id", "target-dsh", "--message-id", message_id)
+        self.cli("agent-message-reply", "--workspace-id", WORKSPACE,
+            "--agent-id", "target-dsh", "--message-id", message_id,
+            "--kind", "progress", "--message", "DSH explicit progress")
+        self.cli("agent-message-reply", "--workspace-id", WORKSPACE,
+            "--agent-id", "target-dsh", "--message-id", message_id,
+            "--message", "DSH explicit final")
+        first = self.cli("agent-message-inbox", "--workspace-id", WORKSPACE,
+            "--agent-id", "codex-peer", "--limit", "1")
+        next_page = self.cli("agent-message-inbox", "--workspace-id", WORKSPACE,
+            "--agent-id", "codex-peer", "--cursor", first["cursor"], "--limit", "10")
+        kinds = [item["kind"] for item in first["items"] + next_page["items"]
+                 if item["message_id"] == message_id]
+        self.assertEqual(kinds, ["ack", "progress", "final"])
+        self.assertEqual(self.cli("agent-message-status", "--workspace-id", WORKSPACE,
+            "--agent-id", "codex-peer", "--message-id", message_id)["reply"], "final")
+
     def test_registered_inventory_exact_alias_scope_and_terminal_state(self):
         handle, _ = self.join()
         args = ("agent-onboarding-status", "--provider", "dsh", "--native-session-id", handle["deepseekHarnessSessionId"])

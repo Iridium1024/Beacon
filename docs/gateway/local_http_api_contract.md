@@ -70,6 +70,19 @@ configuration layer. Gateway route contracts stay unchanged. The Python bridge
 can use the allowlisted OpenAI-compatible provider mode/config or generic
 `provider-api-shape` bridge passthrough.
 
+The opt-in `deepseek_harness_sdk_stdio` Agent backend is also Python-CLI only
+in this release. Gateway exposes no DSH preflight, new-session onboarding,
+owned-live status, stop, recreate, or supervisor IPC route. Queued DSH dispatch
+is consumed by the normal Python worker/daemon, which authenticates to the
+loopback-only Beacon supervisor; Gateway never owns or reconnects that runtime.
+
+The DSH adapter also defines a separate, versioned, GET-only
+projection namespace at `/api/console/v1`. It can list console workspaces,
+provider backend/capability rows, and one bounded workspace/session timeline.
+It cannot invoke or control a provider. Its exact DTO, cursor, reconnect,
+redaction, and authority rules are documented in
+`read_only_session_console_contract.md`.
+
 Gateway `python_cli` passthrough supports allowlisted Python-local provider API
 shapes. In `provider-api-shape` mode, Gateway can pass shape, base URL, model,
 provider name, timeout, temperature, max token,
@@ -125,9 +138,12 @@ and verifies real HTTP calls through Python-local runtime, sanitized bridge
 errors, session lifecycle visibility, and a local fake OpenAI-compatible
 provider path.
 
-`npm start` runs `dist/src/main.js`; run `npm run build` first. Gateway test
-sources live under `gateway/tests` so the standalone release directory can
-be cloned and tested without relying on a parent `tests/gateway` directory.
+`npm start` runs `dist/src/main.js`; run `npm run build` first. That production
+build cleans `dist` and emits only Gateway source. Test commands use the
+separate `npm run build:test` path, which additionally emits `dist/tests`.
+Gateway test sources remain under `gateway/tests` so the standalone release
+directory can be cloned and tested without relying on a parent
+`tests/gateway` directory.
 
 ## Host And Port
 
@@ -179,6 +195,17 @@ POST /api/v1/agent-bindings
 
 The older `/platform/invocations/single-turn` route remains a disabled
 compatibility boundary and still returns not wired.
+
+The independent read-only console spike registers only:
+
+```text
+GET /api/console/v1/workspaces
+GET /api/console/v1/provider-backends
+GET /api/console/v1/workspaces/:workspaceId
+```
+
+It is not part of the writable `/api/v1` resource surface. POST, PUT, PATCH,
+and DELETE are unregistered for this namespace.
 
 ## Response Envelope
 

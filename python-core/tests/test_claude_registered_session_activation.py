@@ -26,6 +26,10 @@ from agent_os.application.services.claude_registered_session import (
     resolve_claude_executable,
     truncate_auto_captured_response,
 )
+from agent_os.application.services.claude_agent_sdk_backend import (
+    ClaudeAgentSdkRunResult,
+    ClaudeAgentSdkRuntime,
+)
 from agent_os.application.services.local_platform_operations import (
     LocalPlatformOperationService,
 )
@@ -216,6 +220,253 @@ class ClaudeRegisteredSessionContractTests(unittest.TestCase):
 
 
 class ClaudeRegisteredSessionOperationTests(unittest.TestCase):
+    def test_agent_sdk_dry_run_reports_preflight_without_start_or_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: _sdk_runtime(compatible=True),
+            )
+            _seed_workspace(service)
+            session_uuid = str(uuid4())
+            service.register_claude_session_handle(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                claude_session_uuid=session_uuid,
+                cwd=directory,
+                created_by="user",
+                reason="explicit registration",
+            )
+
+            result = service.activate_claude_registered_session(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                exchange_request_id="req-claude-1",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                activation_backend="agent_sdk",
+                dry_run=True,
+            )
+            activation = result["claudeRegisteredSessionActivation"]
+
+            self.assertEqual(activation["status"], "dry_run")
+            self.assertEqual(activation["activationBackend"], "agent_sdk")
+            self.assertEqual(activation["replyWritebackMode"], "explicit_only")
+            self.assertEqual(
+                activation["providerRuntimeMetadata"]["preflight"]["status"],
+                "available",
+            )
+            self.assertEqual(
+                activation["providerRuntimeMetadata"]["options"]["cliSource"],
+                "sdk_bundled",
+            )
+            self.assertFalse(activation["providerCommandStarted"])
+            self.assertEqual(_wake_event_count(connection), 0)
+
+    def test_agent_sdk_preflight_failure_does_not_write_ticket_or_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: _sdk_runtime(compatible=False),
+                sdk_runner=lambda *args, **kwargs: self.fail("runner must not start"),
+            )
+            _seed_workspace(service)
+            service.register_claude_session_handle(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                claude_session_uuid=str(uuid4()),
+                cwd=directory,
+                created_by="user",
+                reason="explicit registration",
+            )
+
+            result = service.activate_claude_registered_session(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                exchange_request_id="req-claude-1",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                activation_backend="agent_sdk",
+                dry_run=False,
+            )
+            activation = result["claudeRegisteredSessionActivation"]
+
+            self.assertEqual(activation["status"], "failed")
+            self.assertFalse(activation["providerCommandStarted"])
+            self.assertEqual(
+                activation["responseCaptureStatus"],
+                "not_attempted_preflight_failed",
+            )
+            self.assertFalse(result["wakeTicketWritten"])
+            self.assertFalse(Path(activation["ticketPath"]).exists())
+            self.assertEqual(_wake_event_count(connection), 0)
+
+    def test_agent_sdk_success_defaults_to_explicit_response_writeback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            seen: list[object] = []
+
+            def runner(config, **kwargs):
+                seen.append((config, kwargs))
+                return _sdk_result(final_response="SDK final")
+
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: _sdk_runtime(compatible=True),
+                sdk_runner=runner,
+            )
+            _seed_workspace(service)
+            session_uuid = str(uuid4())
+            service.register_claude_session_handle(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                claude_session_uuid=session_uuid,
+                cwd=directory,
+                created_by="user",
+                reason="explicit registration",
+            )
+
+            result = service.activate_claude_registered_session(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                exchange_request_id="req-claude-1",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                activation_backend="agent_sdk",
+                dry_run=False,
+            )
+            activation = result["claudeRegisteredSessionActivation"]
+            request = service.get_agent_exchange_request_status(
+                "workspace-claude",
+                exchange_request_id="req-claude-1",
+            )["agentExchangeRequest"]
+
+            self.assertEqual(activation["status"], "delivered")
+            self.assertEqual(
+                activation["responseCaptureStatus"],
+                "not_attempted_explicit_only",
+            )
+            self.assertFalse(activation["targetResponseCompleted"])
+            self.assertEqual(request["status"], "active")
+            self.assertEqual(seen[0][0].session_id, session_uuid)
+            self.assertEqual(_wake_event_count(connection), 1)
+
+    def test_agent_sdk_opt_in_final_capture_writes_response_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: _sdk_runtime(compatible=True),
+                sdk_runner=lambda *args, **kwargs: _sdk_result(
+                    final_response="SDK captured final"
+                ),
+            )
+            _seed_workspace(service)
+            service.register_claude_session_handle(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                claude_session_uuid=str(uuid4()),
+                cwd=directory,
+                created_by="user",
+                reason="explicit registration",
+            )
+
+            activation = service.activate_claude_registered_session(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                exchange_request_id="req-claude-1",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                activation_backend="agent_sdk",
+                reply_writeback_mode="provider_final_capture",
+                dry_run=False,
+            )["claudeRegisteredSessionActivation"]
+            request = service.get_agent_exchange_request_status(
+                "workspace-claude",
+                exchange_request_id="req-claude-1",
+            )["agentExchangeRequest"]
+
+            self.assertEqual(activation["responseCaptureStatus"], "recorded")
+            self.assertTrue(activation["targetResponseCompleted"])
+            self.assertEqual(request["responseSummary"], "SDK captured final")
+            self.assertEqual(
+                request["metadata"]["responseSource"],
+                "claude_agent_sdk_final_capture",
+            )
+
+    def test_agent_sdk_session_mismatch_is_failed_and_never_captured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: _sdk_runtime(compatible=True),
+                sdk_runner=lambda *args, **kwargs: _sdk_result(
+                    status="failed",
+                    continuity=False,
+                    final_response=None,
+                    failure_reason="session mismatch",
+                ),
+            )
+            _seed_workspace(service)
+            service.register_claude_session_handle(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                claude_session_uuid=str(uuid4()),
+                cwd=directory,
+                created_by="user",
+                reason="explicit registration",
+            )
+
+            activation = service.activate_claude_registered_session(
+                "workspace-claude",
+                agent_id="agent-b",
+                handle_id="claude-handle-1",
+                exchange_request_id="req-claude-1",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                activation_backend="agent_sdk",
+                reply_writeback_mode="provider_final_capture",
+                dry_run=False,
+            )["claudeRegisteredSessionActivation"]
+
+            self.assertEqual(activation["status"], "failed")
+            self.assertFalse(activation["sessionContinuityVerified"])
+            self.assertEqual(
+                activation["responseCaptureStatus"],
+                "not_attempted_provider_failed",
+            )
+            self.assertFalse(activation["targetResponseCompleted"])
+
     def test_dry_run_renders_ticket_and_command_without_provider_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -545,13 +796,39 @@ class ClaudeRegisteredSessionOperationTests(unittest.TestCase):
                 str(root / "handoff"),
                 "--dry-run",
             )
+            sdk_activated = _run_cli(
+                root,
+                "claude-registered-session-activate",
+                "--workspace-id",
+                "workspace-cli-claude",
+                "--agent-id",
+                "agent-b",
+                "--handle-id",
+                "handle-cli-claude",
+                "--exchange-request-id",
+                "req-cli-claude",
+                "--handoff-directory",
+                str(root / "handoff-sdk"),
+                "--claude-activation-backend",
+                "agent_sdk",
+                "--dry-run",
+            )
 
-            for result in (created, agent, request, registered, listed, activated):
+            for result in (
+                created,
+                agent,
+                request,
+                registered,
+                listed,
+                activated,
+                sdk_activated,
+            ):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
             registered_payload = json.loads(registered.stdout)
             listed_payload = json.loads(listed.stdout)
             activated_payload = json.loads(activated.stdout)
+            sdk_activated_payload = json.loads(sdk_activated.stdout)
             activation = activated_payload["claudeRegisteredSessionActivation"]
 
             self.assertEqual(
@@ -569,6 +846,18 @@ class ClaudeRegisteredSessionOperationTests(unittest.TestCase):
                 ]
             )
             self.assertFalse(activation["providerPermissionProfile"]["selected"])
+            sdk_activation = sdk_activated_payload[
+                "claudeRegisteredSessionActivation"
+            ]
+            self.assertEqual(sdk_activation["activationBackend"], "agent_sdk")
+            self.assertEqual(
+                sdk_activation["replyWritebackMode"],
+                "explicit_only",
+            )
+            self.assertEqual(
+                sdk_activated_payload["claudeControl"]["activationBackend"]["source"],
+                "explicit_cli",
+            )
 
 
 def _fake_claude_command(
@@ -720,7 +1009,17 @@ def _wake_event_count(connection: sqlite3.Connection) -> int:
     )
 
 
-def _service(connection: sqlite3.Connection) -> LocalPlatformOperationService:
+def _service(
+    connection: sqlite3.Connection,
+    *,
+    sdk_runtime_loader=None,
+    sdk_runner=None,
+) -> LocalPlatformOperationService:
+    kwargs = {}
+    if sdk_runtime_loader is not None:
+        kwargs["claude_agent_sdk_runtime_loader"] = sdk_runtime_loader
+    if sdk_runner is not None:
+        kwargs["claude_agent_sdk_runner"] = sdk_runner
     return LocalPlatformOperationService(
         workspace_reader=SqliteWorkspaceStateStore(connection),
         context_reader=SqliteContextStateStore(connection),
@@ -738,6 +1037,51 @@ def _service(connection: sqlite3.Connection) -> LocalPlatformOperationService:
         agent_registration_writer=SqliteAgentRegistrationStateStore(connection),
         conversation_session_writer=SqliteConversationStore(connection),
         conversation_message_writer=SqliteConversationStore(connection),
+        **kwargs,
+    )
+
+
+def _sdk_runtime(*, compatible: bool) -> ClaudeAgentSdkRuntime:
+    return ClaudeAgentSdkRuntime(
+        status="available" if compatible else "not_installed",
+        installed=compatible,
+        compatible=compatible,
+        version="0.2.129" if compatible else None,
+        module=object() if compatible else None,
+        error=None if compatible else "optional SDK is not installed",
+    )
+
+
+def _sdk_result(
+    *,
+    status: str = "completed",
+    continuity: bool = True,
+    final_response: str | None,
+    failure_reason: str | None = None,
+) -> ClaudeAgentSdkRunResult:
+    return ClaudeAgentSdkRunResult(
+        status=status,
+        sdk_version="0.2.129",
+        provider_command_started=True,
+        prompt_submission_attempted=True,
+        prompt_submitted=True,
+        session_continuity_verified=continuity,
+        event_counts={
+            "assistant": 1,
+            "system": 1,
+            "result": 1,
+            "task": 0,
+            "user": 0,
+            "unknown": 0,
+        },
+        final_response=final_response,
+        final_response_source=("result_message" if final_response else None),
+        result_subtype="success" if status == "completed" else "error",
+        cleanup_status="completed",
+        failure_category=None if status == "completed" else "sdk_session_mismatch",
+        failure_reason=failure_reason,
+        ambiguous_delivery=status != "completed",
+        requires_user_review=status != "completed",
     )
 
 

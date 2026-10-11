@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from uuid import uuid4
 
 
@@ -25,6 +26,97 @@ from agent_os.infrastructure.config import LocalPlatformSettings
 
 
 class AgentSessionDiscoveryServiceTests(unittest.TestCase):
+    def test_exact_session_is_preserved_beyond_display_limit_for_all_providers(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd = root / "workspace"
+            cwd.mkdir()
+
+            claude_home = root / "claude-home"
+            claude_project = claude_home / "projects" / "project"
+            claude_project.mkdir(parents=True)
+            claude_target = "claude-exact-old-session"
+            for index, session_id in enumerate(
+                (claude_target, "claude-new-session")
+            ):
+                path = claude_project / f"{session_id}.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": session_id,
+                            "cwd": str(cwd),
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(path, (100 + index, 100 + index))
+
+            codex_home = root / "codex-home"
+            codex_sessions = codex_home / "sessions"
+            codex_sessions.mkdir(parents=True)
+            codex_target = "codex-exact-old-session"
+            for index, session_id in enumerate((codex_target, "codex-new-session")):
+                path = codex_sessions / f"{session_id}.jsonl"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "session_id": session_id,
+                                "cwd": str(cwd),
+                            },
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                os.utime(path, (100 + index, 100 + index))
+
+            hermes_home = root / "hermes-home"
+            hermes_target = "20260710_120000_exactold"
+            _write_hermes_state_db(
+                hermes_home,
+                (
+                    (hermes_target, "cli", str(cwd), 100.0),
+                    ("20260710_120001_newer", "cli", str(cwd), 101.0),
+                ),
+            )
+
+            cases = (
+                (
+                    "claude",
+                    claude_target,
+                    {"claude_home": str(claude_home)},
+                ),
+                (
+                    "codex",
+                    codex_target,
+                    {"codex_home": str(codex_home)},
+                ),
+                (
+                    "hermes",
+                    hermes_target,
+                    {"hermes_home": str(hermes_home), "hermes_source": "cli"},
+                ),
+            )
+            for provider, target, provider_args in cases:
+                with self.subTest(provider=provider):
+                    result = discover_agent_sessions(
+                        provider=provider,
+                        limit=1,
+                        current_session_id=target,
+                        **provider_args,
+                    )
+                    self.assertEqual(result["count"], 1)
+                    self.assertEqual(result["agentSessions"][0]["sessionId"], target)
+                    self.assertTrue(
+                        result["agentSessions"][0]["currentSessionMatch"]
+                    )
+
     def test_discovers_claude_jsonl_without_leaking_message_body(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -838,10 +930,10 @@ class AgentSessionDiscoveryCliTests(unittest.TestCase):
             self.assertTrue(first["ok"])
             self.assertFalse(conflict["ok"])
             self.assertFalse(conflict["completed"])
-            self.assertEqual(conflict["failedStage"], "endpointLogin")
+            self.assertEqual(conflict["failedStage"], "bindingPreflight")
             self.assertEqual(
                 [stage["status"] for stage in conflict["stages"]],
-                ["selected", "created", "registered", "conflict"],
+                ["selected"],
             )
             self.assertEqual(
                 conflict["conflict"]["mismatches"]["agentId"]["actual"],
@@ -857,8 +949,258 @@ class AgentSessionDiscoveryCliTests(unittest.TestCase):
             endpoints = app.list_agent_endpoints(
                 workspace_id="workspace-provider-onboard-conflict",
             )
-            self.assertEqual(len(handles["codexSessionHandles"]), 2)
+            self.assertEqual(len(handles["codexSessionHandles"]), 1)
             self.assertEqual(endpoints["count"], 1)
+            agents = app.get_agent_onboarding_status(
+                workspace_id="workspace-provider-onboard-conflict",
+            )["agents"]["agents"]
+            self.assertNotIn("agent-codex-b", {item["agentId"] for item in agents})
+
+    def test_agent_join_uses_exact_session_and_visible_ids_for_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd, codex_home, first_session_id = _write_codex_session(
+                root,
+                "codex-join-a",
+                index=0,
+            )
+            _, _, second_session_id = _write_codex_session(
+                root,
+                "codex-join-b",
+                cwd=cwd,
+                index=1,
+            )
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "runtime-workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-join",
+                display_name="Join Workspace",
+                root_path=str(cwd),
+            )
+
+            first = app.join_agent(
+                workspace_id="workspace-join",
+                agent_id="planner",
+                provider="codex",
+                session_id=first_session_id,
+                cwd=str(cwd),
+                codex_home=str(codex_home),
+            )
+            reused = app.join_agent(
+                workspace_id="workspace-join",
+                agent_id="planner",
+                provider="codex",
+                session_id=first_session_id,
+                cwd=str(cwd),
+                codex_home=str(codex_home),
+            )
+            second = app.join_agent(
+                workspace_id="workspace-join",
+                agent_id="reviewer",
+                provider="codex",
+                session_id=second_session_id,
+                cwd=str(cwd),
+                codex_home=str(codex_home),
+            )
+            preview = app.send_agent_dispatch(
+                workspace_id="workspace-join",
+                acting_endpoint_alias="planner",
+                to_endpoint_alias="reviewer",
+                message="Please review this.",
+                dry_run=True,
+            )
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(reused["ok"])
+            self.assertTrue(second["ok"])
+            self.assertEqual(first["visibleAgentId"], "planner")
+            self.assertEqual(first["primaryEndpointAlias"], "planner")
+            self.assertEqual(first["sessionSelection"], "exact_id")
+            self.assertFalse(first["databaseScanned"])
+            self.assertEqual(
+                [stage["status"] for stage in reused["onboarding"]["stages"]],
+                ["selected", "reused", "reused", "reused"],
+            )
+            identity = first["onboarding"]["registeredSessionHandle"]["metadata"][
+                "codexSessionIdentity"
+            ]
+            self.assertEqual(identity["runtimeHome"], str(codex_home.resolve()))
+            self.assertEqual(identity["runtimeHomeSource"], "explicit")
+            self.assertEqual(preview["routeSummary"]["source"]["agentId"], "planner")
+            self.assertEqual(preview["routeSummary"]["target"]["agentId"], "reviewer")
+            self.assertEqual(preview["actingIdentity"]["alias"], "planner")
+
+    def test_agent_join_missing_exact_session_writes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd, codex_home, _ = _write_codex_session(root, "codex-join-existing")
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "runtime-workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-join-missing",
+                display_name="Join Missing Workspace",
+                root_path=str(cwd),
+            )
+            before = app.get_agent_onboarding_status(
+                workspace_id="workspace-join-missing",
+            )["agents"]["count"]
+
+            result = app.join_agent(
+                workspace_id="workspace-join-missing",
+                agent_id="missing-agent",
+                provider="codex",
+                session_id="missing-exact-session",
+                cwd=str(cwd),
+                codex_home=str(codex_home),
+            )
+            after = app.get_agent_onboarding_status(
+                workspace_id="workspace-join-missing",
+            )["agents"]["count"]
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["sessionSelection"], "exact_id")
+            self.assertEqual(result["onboarding"]["failedStage"], "sessionDiscovery")
+            self.assertEqual(before, after)
+
+    def test_agent_join_rejects_native_session_claimed_by_another_visible_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd, codex_home, session_id = _write_codex_session(
+                root,
+                "codex-shared-session",
+            )
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "runtime-workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-native-session-owner",
+                display_name="Native Session Owner",
+                root_path=str(cwd),
+            )
+
+            first = app.join_agent(
+                workspace_id="workspace-native-session-owner",
+                agent_id="planner",
+                provider="codex",
+                session_id=session_id,
+                codex_home=str(codex_home),
+            )
+            second = app.join_agent(
+                workspace_id="workspace-native-session-owner",
+                agent_id="reviewer",
+                provider="codex",
+                session_id=session_id,
+                codex_home=str(codex_home),
+            )
+
+            self.assertTrue(first["ok"])
+            self.assertFalse(second["ok"])
+            self.assertEqual(second["onboarding"]["failedStage"], "bindingPreflight")
+            self.assertEqual(
+                second["onboarding"]["conflict"]["existingVisibleAgentId"],
+                "planner",
+            )
+            agents = app.get_agent_onboarding_status(
+                workspace_id="workspace-native-session-owner",
+            )["agents"]["agents"]
+            self.assertNotIn("reviewer", {item["agentId"] for item in agents})
+
+    def test_advanced_provider_onboard_can_explicitly_share_native_session(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cwd, codex_home, session_id = _write_codex_session(
+                root,
+                "codex-explicitly-shared-session",
+            )
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "runtime-workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-explicit-session-share",
+                display_name="Explicit Session Share",
+                root_path=str(cwd),
+            )
+
+            first = app.onboard_agent_provider(
+                workspace_id="workspace-explicit-session-share",
+                provider="codex",
+                session_id=session_id,
+                agent_id="planner",
+                agent_name="Planner",
+                endpoint_alias="planner",
+                codex_home=str(codex_home),
+            )
+            second = app.onboard_agent_provider(
+                workspace_id="workspace-explicit-session-share",
+                provider="codex",
+                session_id=session_id,
+                agent_id="reviewer",
+                agent_name="Reviewer",
+                endpoint_alias="reviewer",
+                codex_home=str(codex_home),
+                allow_shared_session_binding=True,
+            )
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            handles = app.list_codex_session_handles(
+                workspace_id="workspace-explicit-session-share",
+            )["codexSessionHandles"]
+            self.assertEqual(
+                {handle["agentId"] for handle in handles},
+                {"planner", "reviewer"},
+            )
+
+    def test_invalid_workspace_fails_before_provider_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "runtime-workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+
+            with mock.patch.object(
+                LocalPlatformApplication,
+                "discover_agent_sessions",
+                side_effect=AssertionError("provider discovery must not run"),
+            ) as discovery:
+                result = app.onboard_agent_provider(
+                    workspace_id="missing-workspace",
+                    agent_id="agent-a",
+                    agent_name="Agent A",
+                    provider="codex",
+                    endpoint_alias="agent-a",
+                    session_id="session-a",
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failedStage"], "workspacePreflight")
+            discovery.assert_not_called()
 
     def test_application_provider_onboard_ambiguous_discovery_is_actionable(
         self,
@@ -998,8 +1340,8 @@ class AgentSessionDiscoveryCliTests(unittest.TestCase):
                 ["agent", "session_handle", "endpoint_alias"],
             )
             self.assertIn(
-                "agent-provider-onboard",
-                empty["commands"]["providerOnboard"]["command"],
+                "agent-join",
+                empty["commands"]["agentJoin"]["command"],
             )
 
             app.create_agent(
@@ -1018,7 +1360,7 @@ class AgentSessionDiscoveryCliTests(unittest.TestCase):
             self.assertIn("session_handle", only_agent["missing"])
             self.assertEqual(
                 only_agent["nextAction"],
-                "discover_or_register_provider_session",
+                "join_agent_session",
             )
 
             app.register_codex_session_handle(
@@ -1382,6 +1724,70 @@ class AgentSessionDiscoveryCliTests(unittest.TestCase):
             self.assertIn(resolved_profile, first_payload["nextDispatchExampleArgv"])
             self.assertNotIn("--database", first_payload["nextDispatchExampleArgv"])
             self.assertEqual(first_payload["endpointAlias"], "codex-main")
+
+    def test_cli_agent_join_binds_exact_session_to_visible_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "Join Project"
+            session_id = "codex-cli-agent-join"
+            cwd, codex_home, _ = _write_codex_session(root, session_id)
+            profile = _write_local_runtime_profile(
+                root,
+                "workspace-agent-join-cli",
+            )
+            created = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "workspace-create",
+                "--display-name",
+                "Agent Join CLI Workspace",
+                "--root-path",
+                str(cwd),
+            )
+            joined = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-join",
+                "--agent",
+                "codex-reviewer",
+                "--provider",
+                "codex",
+                "--session",
+                session_id,
+                "--cwd",
+                str(cwd),
+                "--codex-home",
+                str(codex_home),
+            )
+            reused = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "join",
+                "--agent",
+                "codex-reviewer",
+                "--provider",
+                "codex",
+                "--session",
+                session_id,
+                "--cwd",
+                str(cwd),
+                "--codex-home",
+                str(codex_home),
+            )
+
+            for result in (created, joined, reused):
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+            payload = json.loads(joined.stdout)
+            reused_payload = json.loads(reused.stdout)
+            self.assertEqual(payload["schema"], "agent_join.v1")
+            self.assertEqual(payload["visibleAgentId"], "codex-reviewer")
+            self.assertEqual(payload["nativeSessionId"], session_id)
+            self.assertEqual(payload["primaryEndpointAlias"], "codex-reviewer")
+            self.assertFalse(payload["databaseScanned"])
+            self.assertEqual(
+                [stage["status"] for stage in reused_payload["onboarding"]["stages"]],
+                ["selected", "reused", "reused", "reused"],
+            )
 
 
 def _write_codex_session(

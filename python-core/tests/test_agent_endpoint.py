@@ -226,6 +226,8 @@ class AgentEndpointApplicationTests(unittest.TestCase):
                 to_endpoint_alias="hermes-target",
                 request_kind="review",
                 request_summary="Review endpoint status.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
             app.record_agent_dispatch_daemon_liveness(
                 workspace_id="workspace-endpoint",
@@ -376,6 +378,8 @@ class AgentEndpointApplicationTests(unittest.TestCase):
                 to_endpoint_alias="codex-target",
                 request_kind="review",
                 request_summary="Review runtime status.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
             app.acquire_agent_dispatch_lease(
                 workspace_id="workspace-endpoint",

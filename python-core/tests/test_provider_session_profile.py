@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_os.application.services.provider_session_profile import (
+    ProviderSessionRegistry,
     load_provider_session_registry,
     resolve_provider_session_registry_path,
     save_provider_session_registry,
@@ -13,6 +14,21 @@ from agent_os.application.services.provider_session_profile import (
 
 
 class ProviderSessionRegistryPathTests(unittest.TestCase):
+    def test_deepseek_harness_existing_session_profile_import_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry = ProviderSessionRegistry(root / "registry.json")
+            with self.assertRaisesRegex(ValueError, "cannot be imported"):
+                registry.register_profile(
+                    provider="deepseek_harness",
+                    provider_session_id="arbitrary-existing-session",
+                    profile_alias="dsh-existing",
+                    cwd=str(root),
+                    created_by="test",
+                    reason="must reject cold import",
+                )
+            self.assertFalse((root / "registry.json").exists())
+
     def test_resolver_reports_stable_path_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1828,7 +1828,18 @@ def launch_deepseek_harness_supervisor(
 
 
 def read_runtime_state(path: str | Path) -> Mapping[str, object]:
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    # Windows can briefly deny a concurrent open while the supervisor replaces
+    # its state snapshot. Retry only that sharing race; malformed JSON and a
+    # persistent access denial still fail closed.
+    deadline = time.monotonic() + 1.0 if os.name == "nt" else 0.0
+    while True:
+        try:
+            raw = json.loads(Path(path).read_text(encoding="utf-8"))
+            break
+        except PermissionError:
+            if os.name != "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
     if not isinstance(raw, MappingABC):
         raise ValueError("DSH runtime state must be a JSON object.")
     return dict(raw)
@@ -2184,7 +2195,18 @@ def _atomic_write_text(path: Path, value: str, *, mode: int) -> None:
             stream.write(value.encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # A reader can briefly hold the old state file open on Windows while
+        # polling a busy supervisor. Keep the atomic replace, but tolerate
+        # that transient sharing violation instead of dropping its IPC reply.
+        deadline = time.monotonic() + 1.0 if os.name == "nt" else 0.0
+        while True:
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
         try:
             os.chmod(path, mode)
         except OSError:

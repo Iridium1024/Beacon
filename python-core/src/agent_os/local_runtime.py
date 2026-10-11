@@ -103,6 +103,12 @@ _NO_RUNTIME_SETTINGS_COMMANDS = {
     "provider-session-profile-register",
 }
 
+# Interim C1-B fence: a cut-over workspace must not silently continue to write
+# authoritative legacy request/dispatch state while those adapters are rewired.
+_UNWIRED_CORE_COMMUNICATION_COMMANDS = {
+    "agent-exchange-wake-watch", "agent-wake-daemon",
+}
+
 _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "agent-activation-revoke",
     "agent-activation-status",
@@ -138,6 +144,24 @@ _WORKSPACE_ID_REQUIRED_COMMANDS = {
     "agent-exchange-request-policy-update",
     "agent-exchange-request-respond",
     "agent-reply",
+    "communication-runtime-init",
+    "communication-runtime-status",
+    "communication-runtime-stop",
+    "communication-runtime-reconcile",
+    "agent-message-wait",
+    "agent-message-wait-status",
+    "agent-message-cancel-wait",
+    "agent-message-get",
+    "agent-message-status",
+    "agent-message-inbox",
+    "agent-message-ack",
+    "agent-message-reply",
+    "agent-message-compact",
+    "communication-short-refs-init",
+    "agent-short-ref",
+    "agent-session-ref",
+    "communication-migrate-preview",
+    "communication-migrate",
     "agent-exchange-status",
     "agent-exchange-thread-close",
     "agent-exchange-thread-follow-up-create",
@@ -246,6 +270,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         _apply_workspace_id_default(args, profile)
         if args.command == "agent-help":
             result = _agent_help(args.topic)
+        elif args.command == "agent-compact-explain":
+            result = LocalPlatformApplication.agent_compact_explain(version=args.version)
         elif args.command in _NO_RUNTIME_SETTINGS_COMMANDS:
             result = _dispatch_provider_session_registry_command(args, profile)
         elif args.command in {"agent-workspace-init", "local-runtime-profile-init"}:
@@ -346,6 +372,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("init")
 
+    migration_preview = subparsers.add_parser("communication-migrate-preview")
+    migration_preview.add_argument("--workspace-id", required=True)
+    migration_run = subparsers.add_parser("communication-migrate")
+    migration_run.add_argument("--workspace-id", required=True)
+    migration_run.add_argument("--operator", required=True)
+    migration_run.add_argument("--backup-path", required=True)
+    migration_run.add_argument("--confirm-stopped-writers", action="store_true", required=True)
+
     agent_help = subparsers.add_parser("agent-help")
     agent_help.add_argument(
         "--topic",
@@ -445,6 +479,8 @@ def _build_parser() -> argparse.ArgumentParser:
     console_workspace = subparsers.add_parser("console-workspace-view")
     console_workspace.add_argument("--workspace-id", required=True)
     console_workspace.add_argument("--cursor")
+    console_workspace.add_argument("--communication-cursor",
+        help="Separate redacted core ledger cursor (ledger:<sequence>); --cursor pages legacy events.")
     console_workspace.add_argument("--limit", type=int, default=50)
 
     open_workspace = subparsers.add_parser("workspace-open")
@@ -539,10 +575,12 @@ def _build_parser() -> argparse.ArgumentParser:
     exchange_request_list.add_argument("--source-agent-id")
     exchange_request_list.add_argument("--target-agent-id")
     exchange_request_list.add_argument("--status")
+    exchange_request_list.add_argument("--agent-id")
 
     exchange_request_get = subparsers.add_parser("agent-exchange-request-get")
     exchange_request_get.add_argument("--workspace-id", required=True)
     exchange_request_get.add_argument("--exchange-request-id", required=True)
+    exchange_request_get.add_argument("--agent-id")
     exchange_request_get.add_argument(
         "--format",
         choices=("json", "compact"),
@@ -559,6 +597,7 @@ def _build_parser() -> argparse.ArgumentParser:
     exchange_status.add_argument("--exchange-request-id")
     exchange_status.add_argument("--dispatch-id")
     exchange_status.add_argument("--thread-id")
+    exchange_status.add_argument("--agent-id")
     _add_runtime_status_policy_arguments(exchange_status)
     exchange_status.add_argument(
         "--waiting-response-stale-threshold-seconds",
@@ -582,6 +621,7 @@ def _build_parser() -> argparse.ArgumentParser:
     exchange_request_respond.add_argument("--response-source")
     exchange_request_respond.add_argument("--actual-writer-agent-id")
     exchange_request_respond.add_argument("--metadata-json")
+    exchange_request_respond.add_argument("--idempotency-key")
 
     exchange_request_close = subparsers.add_parser("agent-exchange-request-close")
     exchange_request_close.add_argument("--workspace-id", required=True)
@@ -589,6 +629,82 @@ def _build_parser() -> argparse.ArgumentParser:
     exchange_request_close.add_argument("--terminal-reason", default="closed")
     exchange_request_close.add_argument("--requires-user-review", action="store_true")
     exchange_request_close.add_argument("--metadata-json")
+    exchange_request_close.add_argument("--agent-id")
+    exchange_request_close.add_argument("--idempotency-key")
+
+    for name in ("agent-message-get", "agent-message-status", "agent-message-ack", "agent-message-reply", "agent-message-compact"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--workspace-id", required=True)
+        command.add_argument("--agent-id", required=True)
+        identity = command.add_mutually_exclusive_group(required=True)
+        identity.add_argument("--message-id")
+        identity.add_argument("--message-ref", help="Explicit workspace-local M reference; not an inferred alias or UUID.")
+        if name == "agent-message-compact":
+            command.add_argument("--include-bodies", action="store_true")
+        if name in {"agent-message-ack", "agent-message-reply"}:
+            command.add_argument("--idempotency-key")
+        if name == "agent-message-reply":
+            command.add_argument("--message", required=True)
+            command.add_argument("--kind", choices=("progress", "final", "reject"), default="final")
+    short_init = subparsers.add_parser("communication-short-refs-init",
+        help="Explicit optional short-reference upgrade; stop writers and choose a new backup file first.")
+    short_init.add_argument("--workspace-id", required=True)
+    short_init.add_argument("--operator", required=True)
+    short_init.add_argument("--backup-path", required=True)
+    short_init.add_argument("--confirm-stopped-writers", action="store_true", required=True)
+    short_query = subparsers.add_parser("agent-short-ref")
+    short_query.add_argument("--workspace-id", required=True)
+    short_query.add_argument("--agent-id", required=True)
+    short_query.add_argument("--kind", choices=("workspace", "message", "thread"), required=True)
+    short_query.add_argument("--ref", required=True)
+    session_query = subparsers.add_parser("agent-session-ref")
+    session_query.add_argument("--workspace-id", required=True)
+    session_query.add_argument("--agent-id", required=True)
+    session_query.add_argument("--session-ref", required=True)
+    session_query.add_argument("--include-native", action="store_true")
+    compact_explain = subparsers.add_parser("agent-compact-explain")
+    compact_explain.add_argument("--version", default="B1")
+    for name in ("communication-runtime-init", "communication-runtime-status", "communication-runtime-stop", "communication-runtime-reconcile"):
+        command = subparsers.add_parser(name, help={
+            "communication-runtime-init": "Explicitly initialize same-DB operational coordination for a core workspace.",
+            "communication-runtime-status": "Read consumer generation/lease without initialization.",
+            "communication-runtime-stop": "Request bounded consumer drain; does not cancel messages.",
+            "communication-runtime-reconcile": "Apply internally retained, correlated native stop evidence.",
+        }[name])
+        command.add_argument("--workspace-id", required=True)
+        if name == "communication-runtime-reconcile":
+            command.add_argument("--attempt-id", required=True,
+                help="Reconcile only internally retained native evidence; cannot submit evidence flags.")
+    message_wait = subparsers.add_parser("agent-message-wait")
+    message_wait.add_argument("--workspace-id", required=True)
+    message_wait.add_argument("--agent-id", required=True)
+    identity = message_wait.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--message-id")
+    identity.add_argument("--message-ref")
+    message_wait.add_argument("--condition", choices=("ack", "final"), default="ack")
+    message_wait.add_argument("--timeout-seconds", type=float, default=120)
+    message_wait.add_argument("--idempotency-key")
+    message_wait.add_argument("--include-bodies", action="store_true")
+    for name in ("agent-message-wait-status", "agent-message-cancel-wait"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--workspace-id", required=True)
+        command.add_argument("--agent-id", required=True)
+        if name == "agent-message-wait-status":
+            identity = command.add_mutually_exclusive_group(required=True)
+            identity.add_argument("--observation-id")
+            identity.add_argument("--message-id", help="List only this caller's waits, for cancellation during an active wait.")
+            identity.add_argument("--message-ref", help="List only this caller's waits using an explicit M reference.")
+        else:
+            command.add_argument("--observation-id", required=True)
+
+    message_inbox = subparsers.add_parser("agent-message-inbox")
+    message_inbox.add_argument("--workspace-id", required=True)
+    message_inbox.add_argument("--agent-id", required=True)
+    message_inbox.add_argument("--cursor",
+        help="Agent-scoped incremental core inbox cursor; restart without it after visibility expansion.")
+    message_inbox.add_argument("--limit", type=int, default=20)
+    message_inbox.add_argument("--include-bodies", action="store_true")
+    message_inbox.add_argument("--compact", action="store_true", help="Add latest authorized compact summaries; never initialize short references.")
 
     dispatch_create = subparsers.add_parser("agent-dispatch-create")
     dispatch_create.add_argument("--workspace-id", required=True)
@@ -632,13 +748,17 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_send.add_argument("--workspace-id", required=True)
     dispatch_send.add_argument("--dispatch-id")
     dispatch_send.add_argument("--exchange-request-id")
+    dispatch_send.add_argument("--idempotency-key",
+        help="Stable retry key scoped to this workspace, source agent, and send operation.")
     dispatch_send.add_argument("--from", "--from-endpoint", dest="from_endpoint_alias")
     dispatch_send.add_argument(
         "--as", "--from-agent", dest="acting_endpoint_alias"
     )
-    dispatch_send.add_argument(
+    target_identity = dispatch_send.add_mutually_exclusive_group()
+    target_identity.add_argument(
         "--to", "--to-endpoint", "--to-agent", dest="to_endpoint_alias"
     )
+    target_identity.add_argument("--target-ref", help="Explicit short session reference; requires one unique active receiving alias.")
     dispatch_send.add_argument("--source-agent-id")
     dispatch_send.add_argument("--target-agent-id")
     dispatch_send.add_argument("--source-handle-id")
@@ -657,9 +777,13 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_send.add_argument("--linked-conversation-id")
     dispatch_send.add_argument("--linked-activation-id")
     dispatch_send.add_argument("--linked-delegated-wake-grant-id")
-    dispatch_send.add_argument("--parent-request-id")
+    reply_identity = dispatch_send.add_mutually_exclusive_group()
+    reply_identity.add_argument("--parent-request-id")
+    reply_identity.add_argument("--reply-ref", help="Explicit M parent reference with a compatible legacy parent mapping.")
     dispatch_send.add_argument("--root-request-id")
-    dispatch_send.add_argument("--thread-id")
+    thread_identity = dispatch_send.add_mutually_exclusive_group()
+    thread_identity.add_argument("--thread-id")
+    thread_identity.add_argument("--thread-ref")
     dispatch_send.add_argument("--turn-index", type=int)
     dispatch_send.add_argument("--expires-at")
     dispatch_send.add_argument("--requires-user-review", action="store_true")
@@ -675,9 +799,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     dispatch_send.add_argument(
         "--wait",
-        choices=("once",),
-        help="Compatibility spelling for the default bounded inline send.",
+        choices=("once", "ack", "final"),
+        help="once keeps inline; ack/final queue to a confirmed core consumer and wait finitely.",
     )
+    dispatch_send.add_argument("--wait-timeout-seconds", type=float, default=120)
     dispatch_send.add_argument(
         "--queued",
         action="store_true",
@@ -773,6 +898,8 @@ def _build_parser() -> argparse.ArgumentParser:
     dispatch_send.add_argument("--ignore-busy-target", action="store_true")
     _add_runtime_status_policy_arguments(dispatch_send)
     dispatch_send.add_argument("--dry-run", action="store_true")
+    dispatch_send.add_argument("--compact-messages", action="store_true",
+        help="Explicitly enable compact provider handoffs when prepared short references are available.")
 
     dispatch_list = subparsers.add_parser("agent-dispatch-list")
     dispatch_list.add_argument("--workspace-id", required=True)
@@ -793,11 +920,13 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     dispatch_list.add_argument("--limit", type=int, default=20)
+    dispatch_list.add_argument("--agent-id")
 
     dispatch_status = subparsers.add_parser("agent-dispatch-status")
     dispatch_status.add_argument("--workspace-id", required=True)
     dispatch_status.add_argument("--dispatch-id")
     dispatch_status.add_argument("--exchange-request-id")
+    dispatch_status.add_argument("--agent-id", help="Requesting agent identity required after core migration")
     _add_runtime_status_policy_arguments(dispatch_status)
     dispatch_status.add_argument(
         "--waiting-response-stale-threshold-seconds",
@@ -946,6 +1075,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_runtime_status_policy_arguments(dispatch_worker)
     dispatch_worker.add_argument("--dry-run", action="store_true")
     dispatch_worker.add_argument("--execute", action="store_true")
+    dispatch_worker.add_argument("--compact-messages", action="store_true")
 
     dispatch_daemon_status = subparsers.add_parser("agent-dispatch-daemon-status")
     dispatch_daemon_status.add_argument("--workspace-id", required=True)
@@ -953,6 +1083,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     dispatch_daemon_start = subparsers.add_parser("agent-dispatch-daemon-start")
     dispatch_daemon_start.add_argument("--workspace-id", required=True)
+    dispatch_daemon_start.add_argument("--activation-concurrency", type=int, default=2)
+    dispatch_daemon_start.add_argument("--consumer-lease-seconds", type=float, default=30)
+    dispatch_daemon_start.add_argument("--shutdown-timeout-seconds", type=float, default=10)
+    dispatch_daemon_start.add_argument("--compact-messages", action="store_true")
+
     dispatch_daemon_start.add_argument("--dispatch-id")
     dispatch_daemon_start.add_argument("--target-agent-id")
     dispatch_daemon_start.add_argument(
@@ -1138,11 +1273,13 @@ def _build_parser() -> argparse.ArgumentParser:
     wake_status = subparsers.add_parser("agent-wake-status")
     wake_status.add_argument("--workspace-id", required=True)
     wake_status.add_argument("--exchange-request-id", required=True)
+    wake_status.add_argument("--agent-id")
 
     wake_ticket_get = subparsers.add_parser("agent-wake-ticket-get")
     wake_ticket_get.add_argument("--workspace-id", required=True)
     wake_ticket_get.add_argument("--exchange-request-id")
     wake_ticket_get.add_argument("--wake-ticket-id")
+    wake_ticket_get.add_argument("--agent-id")
 
     session_discover = subparsers.add_parser("agent-session-discover")
     session_discover.add_argument(
@@ -1582,6 +1719,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     agent_reply.add_argument("--requires-user-review", action="store_true")
     agent_reply.add_argument("--metadata-json")
+    agent_reply.add_argument("--idempotency-key")
 
     endpoint_login = subparsers.add_parser("agent-endpoint-login")
     endpoint_login.add_argument("--workspace-id", required=True)
@@ -2497,6 +2635,11 @@ def _start_agent_dispatch_daemon(
 ) -> Mapping[str, object]:
     if args.wait and not args.once:
         raise ValueError("--wait requires --once to keep daemon startup bounded.")
+    if not args.once and application.communication_mode(args.workspace_id) == "core":
+        if args.target_agent_id or args.dispatch_id:
+            raise ValueError("core consumer is workspace-scoped; select a target/dispatch with --once")
+        if application.communication_runtime_status(workspace_id=args.workspace_id)["state"] == "not_enabled":
+            raise ValueError("run communication-runtime-init before starting the core daemon")
     profile_path = _profile_path_text(args.profile)
     argv = _agent_dispatch_daemon_argv(application.settings, args, profile_path)
     process_hint = {
@@ -2790,10 +2933,15 @@ def _agent_dispatch_daemon_argv(
     )
     _append_argv_option(argv, "--poll-interval-ms", args.poll_interval_ms)
     _append_argv_option(argv, "--heartbeat-interval-ms", args.heartbeat_interval_ms)
+    _append_argv_option(argv, "--activation-concurrency", args.activation_concurrency)
+    _append_argv_option(argv, "--consumer-lease-seconds", args.consumer_lease_seconds)
+    _append_argv_option(argv, "--shutdown-timeout-seconds", args.shutdown_timeout_seconds)
     if args.once:
         argv.append("--once")
     if args.dry_run:
         argv.append("--dry-run")
+    if getattr(args, "compact_messages", False):
+        argv.append("--compact-messages")
     return argv
 
 
@@ -3481,6 +3629,64 @@ def _dispatch(
     application: LocalPlatformApplication,
     args: argparse.Namespace,
 ) -> object:
+    if (args.command in _UNWIRED_CORE_COMMUNICATION_COMMANDS
+            and application.communication_mode(args.workspace_id) == "core"):
+        raise ValueError("communication core workspace route is not yet wired for this command")
+    if args.command == "communication-migrate-preview":
+        return application.communication_migration_preview(args.workspace_id)
+    if args.command == "communication-migrate":
+        return application.communication_migrate(workspace_id=args.workspace_id,
+            operator=args.operator, backup_path=args.backup_path,
+            stopped_writers_confirmed=args.confirm_stopped_writers)
+    if args.command == "communication-runtime-init":
+        return application.communication_runtime_init(workspace_id=args.workspace_id)
+    if args.command == "communication-runtime-status":
+        return application.communication_runtime_status(workspace_id=args.workspace_id)
+    if args.command == "communication-runtime-stop":
+        return application.communication_runtime_stop(workspace_id=args.workspace_id)
+    if args.command == "communication-runtime-reconcile":
+        return application.communication_runtime_reconcile(workspace_id=args.workspace_id, attempt_id=args.attempt_id)
+    if args.command == "communication-short-refs-init":
+        return application.communication_short_refs_init(workspace_id=args.workspace_id,
+            operator=args.operator, backup_path=args.backup_path,
+            stopped_writers_confirmed=args.confirm_stopped_writers)
+    if args.command == "agent-short-ref":
+        return application.agent_short_ref(workspace_id=args.workspace_id, agent_id=args.agent_id,
+                                          kind=args.kind, reference=args.ref)
+    if args.command == "agent-session-ref":
+        return application.agent_session_ref(workspace_id=args.workspace_id, agent_id=args.agent_id,
+            session_ref=args.session_ref, include_native=args.include_native)
+    if args.command == "agent-message-compact":
+        return application.agent_message_compact(workspace_id=args.workspace_id, agent_id=args.agent_id,
+            message_id=args.message_id, message_ref=args.message_ref, include_bodies=args.include_bodies)
+    if args.command == "agent-message-wait":
+        return application.agent_message_wait(workspace_id=args.workspace_id, agent_id=args.agent_id,
+            message_id=args.message_id, message_ref=args.message_ref,
+            condition=args.condition, timeout=args.timeout_seconds,
+            key=args.idempotency_key, include_bodies=args.include_bodies)
+    if args.command in {"agent-message-wait-status", "agent-message-cancel-wait"}:
+        return application.agent_message_wait_status(workspace_id=args.workspace_id, agent_id=args.agent_id,
+            observation_id=args.observation_id, message_id=getattr(args,"message_id",None),
+            message_ref=getattr(args,"message_ref",None),
+            cancel=args.command == "agent-message-cancel-wait")
+    if args.command == "agent-message-get":
+        return application.agent_message_get(workspace_id=args.workspace_id,
+            agent_id=args.agent_id, message_id=args.message_id, message_ref=args.message_ref)
+    if args.command == "agent-message-status":
+        return application.agent_message_status(workspace_id=args.workspace_id,
+            agent_id=args.agent_id, message_id=args.message_id, message_ref=args.message_ref)
+    if args.command == "agent-message-inbox":
+        return application.agent_message_inbox(workspace_id=args.workspace_id,
+            agent_id=args.agent_id, cursor=args.cursor, limit=args.limit,
+            include_bodies=args.include_bodies, compact=args.compact)
+    if args.command == "agent-message-ack":
+        return application.agent_message_ack(workspace_id=args.workspace_id,
+            agent_id=args.agent_id, message_id=args.message_id, message_ref=args.message_ref,
+            idempotency_key=args.idempotency_key)
+    if args.command == "agent-message-reply":
+        return application.agent_message_reply(workspace_id=args.workspace_id,
+            agent_id=args.agent_id, message_id=args.message_id, message_ref=args.message_ref, body=args.message,
+            kind=args.kind, idempotency_key=args.idempotency_key)
     if args.command == "init":
         return application.initialize_database()
     if args.command in {"agent-runtime-preflight", "agent-runtime-doctor"}:
@@ -3545,6 +3751,7 @@ def _dispatch(
         return application.get_console_workspace_view(
             workspace_id=args.workspace_id,
             cursor=args.cursor,
+            communication_cursor=args.communication_cursor,
             limit=args.limit,
         )
     if args.command == "workspace-open":
@@ -3647,6 +3854,7 @@ def _dispatch(
             source_agent_id=args.source_agent_id,
             target_agent_id=args.target_agent_id,
             status=args.status,
+            requesting_agent_id=args.agent_id,
         )
     if args.command == "agent-exchange-request-get":
         if args.format == "compact":
@@ -3654,6 +3862,7 @@ def _dispatch(
                 application.get_agent_exchange_status_summary(
                     workspace_id=args.workspace_id,
                     exchange_request_id=args.exchange_request_id,
+                    requesting_agent_id=args.agent_id,
                     waiting_response_stale_threshold_seconds=(
                         args.waiting_response_stale_threshold_seconds
                     ),
@@ -3662,6 +3871,7 @@ def _dispatch(
         return application.get_agent_exchange_request_status(
             workspace_id=args.workspace_id,
             exchange_request_id=args.exchange_request_id,
+            requesting_agent_id=args.agent_id,
         )
     if args.command == "agent-exchange-status":
         result = application.get_agent_exchange_status_summary(
@@ -3669,6 +3879,7 @@ def _dispatch(
             exchange_request_id=args.exchange_request_id,
             dispatch_id=args.dispatch_id,
             thread_id=args.thread_id,
+            requesting_agent_id=args.agent_id,
             read_live_runtime_status=args.runtime_status_policy,
             waiting_response_stale_threshold_seconds=(
                 args.waiting_response_stale_threshold_seconds
@@ -3685,6 +3896,7 @@ def _dispatch(
                 True if args.requires_user_review else None
             ),
             metadata=_response_metadata_from_args(args),
+            idempotency_key=args.idempotency_key,
         )
     if args.command == "agent-exchange-request-close":
         return application.close_agent_exchange_request(
@@ -3695,6 +3907,8 @@ def _dispatch(
                 True if args.requires_user_review else None
             ),
             metadata=_json_object(args.metadata_json, "metadata-json"),
+            closing_agent_id=args.agent_id,
+            idempotency_key=args.idempotency_key,
         )
     if args.command == "agent-dispatch-create":
         return application.create_agent_dispatch(
@@ -3744,9 +3958,12 @@ def _dispatch(
             workspace_id=args.workspace_id,
             dispatch_id=args.dispatch_id,
             exchange_request_id=args.exchange_request_id,
+            idempotency_key=args.idempotency_key,
             acting_endpoint_alias=args.acting_endpoint_alias,
             from_endpoint_alias=args.from_endpoint_alias,
             to_endpoint_alias=args.to_endpoint_alias,
+            target_ref=args.target_ref, thread_ref=args.thread_ref, reply_ref=args.reply_ref,
+            compact_messages=args.compact_messages,
             source_agent_id=args.source_agent_id,
             target_agent_id=args.target_agent_id,
             source_handle_id=args.source_handle_id,
@@ -3768,6 +3985,8 @@ def _dispatch(
             expires_at=_optional_datetime_arg(args.expires_at, "expires-at"),
             requires_user_review=args.requires_user_review,
             metadata=_metadata_from_args(args),
+            wait_condition=args.wait if args.wait in {"ack", "final"} else None,
+            wait_timeout_seconds=args.wait_timeout_seconds,
             delivery_mode=delivery_mode,
             delivery_mode_source=delivery_mode_source,
             immediate_busy_policy=(
@@ -3826,6 +4045,8 @@ def _dispatch(
             read_live_runtime_status=args.runtime_status_policy,
             dry_run=args.dry_run,
         )
+        if args.wait in {"ack", "final"}:
+            return result
         return {
             **dict(result),
             "claudeControl": claude_control.to_metadata(),
@@ -3840,12 +4061,14 @@ def _dispatch(
             target_agent_id=args.target_agent_id,
             status=args.status,
             limit=args.limit,
+            requesting_agent_id=args.agent_id,
         )
     if args.command == "agent-dispatch-status":
         result = application.get_agent_dispatch_status(
             workspace_id=args.workspace_id,
             dispatch_id=args.dispatch_id,
             exchange_request_id=args.exchange_request_id,
+            requesting_agent_id=args.agent_id,
             read_live_runtime_status=args.runtime_status_policy,
             waiting_response_stale_threshold_seconds=(
                 args.waiting_response_stale_threshold_seconds
@@ -3952,6 +4175,7 @@ def _dispatch(
             skip_busy_target=not args.ignore_busy_target,
             read_live_runtime_status=args.runtime_status_policy,
             dry_run=args.dry_run,
+            compact_messages=args.compact_messages,
         )
         return {
             **dict(result),
@@ -4040,12 +4264,14 @@ def _dispatch(
         return application.get_agent_wake_status(
             workspace_id=args.workspace_id,
             exchange_request_id=args.exchange_request_id,
+            requesting_agent_id=args.agent_id,
         )
     if args.command == "agent-wake-ticket-get":
         return application.get_agent_wake_ticket(
             workspace_id=args.workspace_id,
             exchange_request_id=args.exchange_request_id,
             wake_ticket_id=args.wake_ticket_id,
+            requesting_agent_id=args.agent_id,
         )
     if args.command == "agent-session-discover":
         return application.discover_agent_sessions(
@@ -5108,6 +5334,10 @@ def _dispatch_delivery_mode_from_args(
     delivery_mode = getattr(args, "delivery_mode", None)
     wait_mode = getattr(args, "wait", None)
     queued = bool(getattr(args, "queued", False))
+    if wait_mode in {"ack", "final"}:
+        if queued or delivery_mode is not None:
+            raise ValueError("ACK/final wait already selects the consumer queue; omit other delivery flags")
+        return "queued", "explicit_wait"
     selection = resolve_agent_dispatch_delivery_mode(
         delivery_mode=delivery_mode,
         wait_mode=wait_mode,
@@ -5751,6 +5981,21 @@ def _agent_endpoint_compact_identity(
 def _agent_exchange_compact_status(
     status: Mapping[str, object],
 ) -> Mapping[str, object]:
+    if status.get("engine") == "core":
+        request = _mapping_value(status.get("agentExchangeRequest"))
+        facts = _mapping_value(status.get("messageStatus"))
+        delivery = _mapping_value(facts.get("delivery"))
+        return {"schema": "agent_exchange_compact_status.core.v1",
+            "engine": "core", "workspaceId": request.get("workspaceId"),
+            "requestId": request.get("exchangeRequestId"), "messageId": request.get("messageId"),
+            "sourceAgentId": request.get("sourceAgentId"),
+            "targetAgentId": request.get("targetAgentId"),
+            "requestStatus": request.get("status"),
+            "deliverySchedule": delivery.get("schedule"),
+            "delivery": delivery.get("delivery"), "execution": delivery.get("execution"),
+            "acknowledged": facts.get("acknowledged"), "reply": facts.get("reply"),
+            "sourceEventSequence": None,
+            "communicationLedgerSequence": status.get("communicationLedgerSequence")}
     request = _mapping_value(status.get("agentExchangeRequest"))
     dispatch = _mapping_value(status.get("agentDispatch"))
     wake = _mapping_value(status.get("wakeStatus"))

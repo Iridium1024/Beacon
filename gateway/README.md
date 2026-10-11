@@ -30,18 +30,23 @@ and build outputs are local artifacts and must remain untracked.
 
 ## Build, Test, And Start
 
-`tsconfig.json` uses `rootDir=.` and `outDir=dist`, so a package-local build
-emits:
+`tsconfig.json` uses `rootDir=.` and `outDir=dist`. A production build emits:
 
 ```text
 dist/src/main.js
-dist/tests/*.test.js
 ```
+
+`tsconfig.test.json` extends the production configuration and additionally
+emits `dist/tests/*.test.js` for test runs. Both build paths clean `dist` first,
+so a later production build cannot retain stale compiled tests.
 
 The npm scripts are:
 
-- `npm run build`: compile Gateway source and package-local tests.
-- `npm run check`: type-check without emitting files.
+- `npm run clean`: remove the generated `dist` directory.
+- `npm run build`: clean and compile production Gateway source only.
+- `npm run build:test`: clean and compile Gateway source plus package-local
+  tests.
+- `npm run check`: type-check source and tests without emitting files.
 - `npm test`: run the current platform mainline tests.
 - `npm run test:platform-route`: run platform route/config/API contract tests.
 - `npm run test:platform-bridge`: run Python bridge and HTTP bridge smoke tests.

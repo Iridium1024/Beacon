@@ -144,15 +144,40 @@ Current adapter linkage:
   command through this preflight layer before rendering `claude --resume`, and
   records the executable resolution in activation audit. Explicit paths still
   bypass discovery and are respected as user-provided inputs.
+- When the opt-in Claude `agent_sdk` backend is selected, the additive
+  `providerProtocolChecks.claudeAgentSdk` block checks optional package version
+  `>=0.2.127,<0.3.0`, Python compatibility, and required public symbols without
+  starting a session. It also reports additive `optionalCapabilities` for the
+  `ConversationResetMessage`, `ResultMessage.origin`, and `ResultError`
+  surfaces audited against `0.2.144`; a false optional capability does not make
+  an otherwise supported older SDK incompatible.
+  The SDK's bundled executable is used by default; an incompatible SDK fails
+  before wake-ticket delivery and never falls back silently to `claude_cli`.
 - Hermes registered-session activation resolves the default bare `hermes`
   command through this preflight layer before rendering
   `hermes chat --query <platform handoff> --quiet --resume <session-id>
   --source agent-os`. Explicit paths still bypass discovery and are respected
   as user-provided inputs.
+- Opt-in `hermes_tui_gateway_stdio` has a separate, stricter read-only preflight
+  against `--hermes-gateway-python`. That same interpreter must report exact
+  installed `hermes-agent==0.19.0`, package location,
+  `tui_gateway.entry`/server source, `gateway.ready`, and every required
+  session/prompt/interaction method and event. The probe reads distribution and
+  source metadata only: it does not launch the gateway or submit a prompt.
+  Missing, local `0.18.0`, official-main `0.20.5`, and unknown versions are
+  unsupported until a new explicit capability audit is added. Failure occurs
+  before wake-ticket delivery and never falls back to `hermes_cli`.
+- `deepseek_harness_sdk_stdio` likewise has a separate command,
+  `deepseek-harness-runtime-preflight`. It verifies the exact Node/Python
+  carrier, public SDK/server packages and runtime entry, audited commit,
+  required methods/notifications, platform route, Cordis config, runtime-home
+  access, and supervisor/lease capability. Windows accepts only the Node 22.19+
+  route. The probe never starts a DSH session or reads credentials; failure
+  occurs before any visible Agent/handle/endpoint registration.
 
-This linkage only selects the correct local executable path. It does not change
-the provider-specific activation recipe, session-handle model, credential
-policy, permission model, or transport boundary.
+CLI linkage only selects the correct local executable path. The Claude SDK
+check separately validates the selected optional library surface; neither check
+changes the session-handle model, credential policy, or permission model.
 
 ## Permission Profile Boundary
 
