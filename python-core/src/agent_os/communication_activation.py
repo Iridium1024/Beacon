@@ -18,7 +18,7 @@ def run_activation(payload, *, configure=None):
     if settings.initialize_schema or set(payload["options"]) - PROVIDER_OPTIONS:
         raise CommunicationError("activation must use prepared schema and allowlisted provider options")
     components = build_local_platform_runtime(settings)
-    components.connection.execute("PRAGMA busy_timeout=100")
+    components.connection.execute("PRAGMA busy_timeout=250")
     claim = Claim(**payload["claim"])
     service = None
     try:

@@ -2322,7 +2322,7 @@ def _fake_codex_command(
     )
     if os.name == "nt":
         command.write_text(
-            "\n".join(["@echo off", f'"{sys.executable}" "{script}" %*']),
+            "\n".join(["@echo off", "chcp 65001 >nul", f'"{sys.executable}" "{script}" %*']),
             encoding="utf-8",
         )
     else:

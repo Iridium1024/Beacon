@@ -904,6 +904,7 @@ def _fake_claude_command(
             "\n".join(
                 [
                     "@echo off",
+                    "chcp 65001 >nul",
                     f"set FAKE_CLAUDE_CAPTURE={capture_path}",
                     f'"{sys.executable}" "{script}" %*',
                 ]

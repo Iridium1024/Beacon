@@ -102,7 +102,7 @@ class CommunicationCliIntegrationTests(unittest.TestCase):
             "--confirm-stopped-writers")
         self.assertTrue(migrated["migration"]["created"])
         self.assertEqual(migrated["postMigrationPreview"]["engine"], "core")
-        self.assertEqual(migrated["backup"]["path"], str(backup_path))
+        self.assertTrue(Path(migrated["backup"]["path"]).samefile(backup_path))
         with closing(sqlite3.connect(backup_path)) as backup:
             self.assertEqual(backup.execute("SELECT COUNT(*) FROM platform_events").fetchone()[0],
                              self.connection.execute("SELECT COUNT(*) FROM platform_events").fetchone()[0])

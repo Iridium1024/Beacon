@@ -21,7 +21,7 @@ def prepared_runtime(settings, workspace_id):
     try:
         # Provider I/O never holds a transaction. A contended coordination
         # write must fail closed promptly, rather than block heartbeats for 5s.
-        components.connection.execute("PRAGMA busy_timeout=100")
+        components.connection.execute("PRAGMA busy_timeout=250")
         service = components.communication(workspace_id)
         if service is None:
             raise CommunicationError("runtime/wait requires an explicitly migrated core workspace")
