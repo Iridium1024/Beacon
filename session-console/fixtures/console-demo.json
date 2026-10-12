@@ -1,0 +1,168 @@
+{
+  "workspaces": {
+    "schema": "beacon.console.v1",
+    "schemaMajor": 1,
+    "authority": "beacon",
+    "displayShell": "beacon_read_only_projection",
+    "readOnly": true,
+    "items": [
+      {
+        "schema": "console_workspace_view.v1",
+        "workspaceId": "workspace-demo",
+        "displayName": "Demo Workspace",
+        "rootSummary": "…/Demo Workspace",
+        "status": { "value": "active", "rawValue": "active", "known": true },
+        "updatedAt": "2026-08-24T01:42:18+00:00",
+        "sourceEventSequence": 184
+      }
+    ],
+    "count": 1,
+    "sort": "displayName_asc_workspaceId_asc"
+  },
+  "providerBackends": {
+    "schema": "beacon.console.v1",
+    "schemaMajor": 1,
+    "authority": "beacon",
+    "readOnly": true,
+    "items": [
+      {
+        "schema": "provider_backend_view.v1",
+        "provider": "claude",
+        "backendId": "claude_agent_sdk",
+        "officialInterface": "Claude Agent SDK",
+        "beaconImplementation": "short_lived_agent_sdk_streaming_operation",
+        "lifecycle": { "value": "short_lived_operation", "rawValue": "short_lived_operation", "known": true },
+        "runtimeOwnership": { "value": "operation_owned", "rawValue": "operation_owned", "known": true },
+        "statusAuthority": { "value": "unsupported", "rawValue": "unsupported", "known": true },
+        "capabilities": { "canSend": true, "canResume": true, "canReadStatus": false, "canReadOwnedLiveStatus": false, "canSupplementActiveTurn": false, "canCancel": false, "canHandleApprovalRequests": false, "canReadHistory": false, "canCaptureFinalMessage": true, "canResumeAcrossProcess": true, "canOwnRuntime": true, "canManageMultipleThreads": false },
+        "continuityScope": null,
+        "canResumeAcrossRuntimeRestart": null,
+        "maxConcurrentOperations": null,
+        "existingSessionImport": null
+      },
+      {
+        "schema": "provider_backend_view.v1",
+        "provider": "codex",
+        "backendId": "codex_app_server_stdio",
+        "officialInterface": "Codex app-server stdio",
+        "beaconImplementation": "short_lived_app_server_stdio_operation",
+        "lifecycle": { "value": "short_lived_operation", "rawValue": "short_lived_operation", "known": true },
+        "runtimeOwnership": { "value": "operation_owned", "rawValue": "operation_owned", "known": true },
+        "statusAuthority": { "value": "point_read", "rawValue": "point_read", "known": true },
+        "capabilities": { "canSend": true, "canResume": true, "canReadStatus": true, "canReadOwnedLiveStatus": false, "canSupplementActiveTurn": true, "canCancel": false, "canHandleApprovalRequests": true, "canReadHistory": false, "canCaptureFinalMessage": true, "canResumeAcrossProcess": true, "canOwnRuntime": true, "canManageMultipleThreads": false },
+        "continuityScope": null,
+        "canResumeAcrossRuntimeRestart": null,
+        "maxConcurrentOperations": null,
+        "existingSessionImport": null
+      },
+      {
+        "schema": "provider_backend_view.v1",
+        "provider": "deepseek_harness",
+        "backendId": "deepseek_harness_sdk_stdio",
+        "officialInterface": "DeepSeek Harness SDK JSON-RPC stdio",
+        "beaconImplementation": "persistent_owned_sdk_jsonrpc_stdio_supervisor",
+        "lifecycle": { "value": "managed_runtime", "rawValue": "managed_runtime", "known": true },
+        "runtimeOwnership": { "value": "persistent_owned", "rawValue": "persistent_owned", "known": true },
+        "statusAuthority": { "value": "owned_live", "rawValue": "owned_live", "known": true },
+        "capabilities": { "canSend": true, "canResume": true, "canReadStatus": true, "canReadOwnedLiveStatus": true, "canSupplementActiveTurn": false, "canCancel": false, "canHandleApprovalRequests": false, "canReadHistory": false, "canCaptureFinalMessage": true, "canResumeAcrossProcess": true, "canOwnRuntime": true, "canManageMultipleThreads": false },
+        "continuityScope": "persistent_native_session",
+        "canResumeAcrossRuntimeRestart": true,
+        "maxConcurrentOperations": 1,
+        "existingSessionImport": true
+      },
+      {
+        "schema": "provider_backend_view.v1",
+        "provider": "hermes",
+        "backendId": "hermes_tui_gateway_stdio",
+        "officialInterface": "Hermes TUI gateway stdio",
+        "beaconImplementation": "short_lived_tui_gateway_stdio_operation",
+        "lifecycle": { "value": "short_lived_operation", "rawValue": "short_lived_operation", "known": true },
+        "runtimeOwnership": { "value": "operation_owned", "rawValue": "operation_owned", "known": true },
+        "statusAuthority": { "value": "point_read", "rawValue": "point_read", "known": true },
+        "capabilities": { "canSend": true, "canResume": true, "canReadStatus": true, "canReadOwnedLiveStatus": false, "canSupplementActiveTurn": false, "canCancel": true, "canHandleApprovalRequests": false, "canReadHistory": false, "canCaptureFinalMessage": true, "canResumeAcrossProcess": true, "canOwnRuntime": true, "canManageMultipleThreads": false },
+        "continuityScope": null,
+        "canResumeAcrossRuntimeRestart": null,
+        "maxConcurrentOperations": null,
+        "existingSessionImport": null
+      },
+      {
+        "schema": "provider_backend_view.v1",
+        "provider": "future_agent",
+        "backendId": "future_backend_preview",
+        "officialInterface": "Unrecognized future interface",
+        "beaconImplementation": "unrecognized_future_backend",
+        "lifecycle": { "value": "unknown", "rawValue": "shared_runtime_v2", "known": false },
+        "runtimeOwnership": { "value": "unknown", "rawValue": "federated_owner", "known": false },
+        "statusAuthority": { "value": "unknown", "rawValue": "leased_snapshot", "known": false },
+        "capabilities": { "canSend": null, "canResume": null, "canReadStatus": null, "canReadOwnedLiveStatus": null, "canSupplementActiveTurn": null, "canCancel": null, "canHandleApprovalRequests": null, "canReadHistory": null, "canCaptureFinalMessage": null, "canResumeAcrossProcess": null, "canOwnRuntime": null, "canManageMultipleThreads": null },
+        "continuityScope": null,
+        "canResumeAcrossRuntimeRestart": null,
+        "maxConcurrentOperations": null,
+        "existingSessionImport": null
+      }
+    ],
+    "count": 5,
+    "sort": "backendId_asc"
+  },
+  "workspaceViews": {
+    "workspace-demo": {
+      "schema": "beacon.console.v1",
+      "schemaMajor": 1,
+      "authority": "beacon",
+      "displayShell": "beacon_read_only_projection",
+      "readOnly": true,
+      "workspace": {
+        "schema": "console_workspace_view.v1",
+        "workspaceId": "workspace-demo",
+        "displayName": "Demo Workspace",
+        "rootSummary": "…/Demo Workspace",
+        "status": { "value": "active", "rawValue": "active", "known": true },
+        "updatedAt": "2026-08-24T01:42:18+00:00",
+        "sourceEventSequence": 184
+      },
+      "agents": [
+        { "schema": "console_agent_view.v1", "workspaceId": "workspace-demo", "agentId": "agent-claude-demo", "displayName": "Claude reviewer", "status": { "value": "active", "rawValue": "active", "known": true }, "capabilityNames": ["review"], "sourceEventSequence": 21 },
+        { "schema": "console_agent_view.v1", "workspaceId": "workspace-demo", "agentId": "agent-codex-demo", "displayName": "Codex builder", "status": { "value": "active", "rawValue": "active", "known": true }, "capabilityNames": ["implement"], "sourceEventSequence": 24 },
+        { "schema": "console_agent_view.v1", "workspaceId": "workspace-demo", "agentId": "agent-hermes-demo", "displayName": "Hermes operator", "status": { "value": "active", "rawValue": "active", "known": true }, "capabilityNames": ["operate"], "sourceEventSequence": 27 },
+        { "schema": "console_agent_view.v1", "workspaceId": "workspace-demo", "agentId": "agent-dsh-demo", "displayName": "DSH managed agent", "status": { "value": "active", "rawValue": "active", "known": true }, "capabilityNames": ["managed-runtime"], "sourceEventSequence": 31 }
+      ],
+      "sessions": [
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "claude", "nativeSessionId": "shared-native-01" }, "workspaceId": "workspace-demo", "agentId": "agent-claude-demo", "handleId": "claude-handle-01", "state": { "value": "active", "rawValue": "active", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T01:41:12+00:00", "sourceEventSequence": 171, "nativeDshSession": false, "foreignProjectionOnly": true, "continuity": { "scope": "registered_provider_session", "state": "observed", "resumeAcrossRuntimeRestart": null } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "claude", "nativeSessionId": "claude-demo-02" }, "workspaceId": "workspace-demo", "agentId": "agent-claude-demo", "handleId": "claude-handle-02", "state": { "value": "inactive", "rawValue": "inactive", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T00:55:00+00:00", "sourceEventSequence": 119, "nativeDshSession": false, "foreignProjectionOnly": true, "continuity": { "scope": "registered_provider_session", "state": "observed", "resumeAcrossRuntimeRestart": null } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "codex", "nativeSessionId": "shared-native-01" }, "workspaceId": "workspace-demo", "agentId": "agent-codex-demo", "handleId": "codex-handle-01", "state": { "value": "active", "rawValue": "active", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T01:42:18+00:00", "sourceEventSequence": 184, "nativeDshSession": false, "foreignProjectionOnly": true, "continuity": { "scope": "registered_provider_session", "state": "observed", "resumeAcrossRuntimeRestart": null } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "codex", "nativeSessionId": "codex-demo-02" }, "workspaceId": "workspace-demo", "agentId": "agent-codex-demo", "handleId": "codex-handle-02", "state": { "value": "inactive", "rawValue": "inactive", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-23T23:49:11+00:00", "sourceEventSequence": 102, "nativeDshSession": false, "foreignProjectionOnly": true, "continuity": { "scope": "registered_provider_session", "state": "observed", "resumeAcrossRuntimeRestart": null } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "hermes", "nativeSessionId": "shared-native-01" }, "workspaceId": "workspace-demo", "agentId": "agent-hermes-demo", "handleId": "hermes-handle-01", "state": { "value": "active", "rawValue": "active", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T01:40:43+00:00", "sourceEventSequence": 168, "nativeDshSession": false, "foreignProjectionOnly": true, "continuity": { "scope": "registered_provider_session", "state": "observed", "resumeAcrossRuntimeRestart": null } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "deepseek_harness", "nativeSessionId": "shared-native-01" }, "workspaceId": "workspace-demo", "agentId": "agent-dsh-demo", "handleId": "dsh-handle-01", "state": { "value": "active", "rawValue": "active", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T01:39:31+00:00", "sourceEventSequence": 162, "nativeDshSession": true, "foreignProjectionOnly": false, "continuity": { "scope": "persistent_native_session", "state": "native_session_available", "resumeAcrossRuntimeRestart": true } },
+        { "schema": "foreign_session_ref.v1", "identity": { "provider": "deepseek_harness", "nativeSessionId": "dsh-demo-lost" }, "workspaceId": "workspace-demo", "agentId": "agent-dsh-demo", "handleId": "dsh-handle-lost", "state": { "value": "continuity_lost", "rawValue": "continuity_lost", "known": true }, "cwdSummary": "…/Demo Workspace", "updatedAt": "2026-08-24T01:22:09+00:00", "sourceEventSequence": 149, "nativeDshSession": true, "foreignProjectionOnly": false, "continuity": { "scope": "persistent_native_session", "state": "resume_required", "resumeAcrossRuntimeRestart": true } }
+      ],
+      "providerBackends": [],
+      "dispatches": [
+        { "schema": "dispatch_projection.v1", "workspaceId": "workspace-demo", "dispatchId": "dispatch-demo-02", "exchangeRequestId": "request-demo-02", "sourceAgentId": "agent-codex-demo", "targetAgentId": "agent-dsh-demo", "targetProvider": "deepseek_harness", "targetHandleId": "dsh-handle-01", "status": { "value": "waiting_response", "rawValue": "waiting_response", "known": true }, "apiLayer": "delivery-oriented", "updatedAt": "2026-08-24T01:42:18+00:00" },
+        { "schema": "dispatch_projection.v1", "workspaceId": "workspace-demo", "dispatchId": "dispatch-demo-01", "exchangeRequestId": "request-demo-01", "sourceAgentId": "agent-claude-demo", "targetAgentId": "agent-hermes-demo", "targetProvider": "hermes", "targetHandleId": "hermes-handle-01", "status": { "value": "completed", "rawValue": "completed", "known": true }, "apiLayer": "delivery-oriented", "updatedAt": "2026-08-24T01:31:00+00:00" }
+      ],
+      "timeline": {
+        "schema": "console_timeline_page.v1",
+        "events": [
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-001", "workspaceOrdinal": 1, "sourceEventSequence": 21, "occurredAt": "2026-08-24T00:06:00+00:00", "category": { "value": "identity", "rawValue": "identity", "known": true }, "eventKind": "agent_registration.changed", "aggregateType": "agent_registration", "aggregateId": "agent-claude-demo", "summary": "Agent registration changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-001" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-002", "workspaceOrdinal": 2, "sourceEventSequence": 31, "occurredAt": "2026-08-24T00:12:00+00:00", "category": { "value": "identity", "rawValue": "identity", "known": true }, "eventKind": "agent_endpoint.changed", "aggregateType": "agent_endpoint", "aggregateId": "endpoint-dsh-demo", "summary": "Agent endpoint identity changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-002" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-003", "workspaceOrdinal": 3, "sourceEventSequence": 102, "occurredAt": "2026-08-23T23:49:11+00:00", "category": { "value": "session", "rawValue": "session", "known": true }, "eventKind": "codex_registered_session_handle.changed", "aggregateType": "codex_registered_session_handle", "aggregateId": "codex-handle-02", "summary": "Codex session handle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-003" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-004", "workspaceOrdinal": 4, "sourceEventSequence": 149, "occurredAt": "2026-08-24T01:22:09+00:00", "category": { "value": "runtime", "rawValue": "runtime", "known": true }, "eventKind": "deepseek_harness_runtime_lifecycle.recorded", "aggregateType": "deepseek_harness_runtime", "aggregateId": "dsh-runtime-demo", "summary": "DSH runtime lifecycle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-004" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-005", "workspaceOrdinal": 5, "sourceEventSequence": 150, "occurredAt": "2026-08-24T01:22:10+00:00", "category": { "value": "session", "rawValue": "session", "known": true }, "eventKind": "deepseek_harness_registered_session_handle.changed", "aggregateType": "deepseek_harness_registered_session_handle", "aggregateId": "dsh-handle-lost", "summary": "DSH session handle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-005" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-006", "workspaceOrdinal": 6, "sourceEventSequence": 162, "occurredAt": "2026-08-24T01:39:31+00:00", "category": { "value": "session", "rawValue": "session", "known": true }, "eventKind": "deepseek_harness_registered_session_handle.changed", "aggregateType": "deepseek_harness_registered_session_handle", "aggregateId": "dsh-handle-01", "summary": "DSH session handle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-006" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-007", "workspaceOrdinal": 7, "sourceEventSequence": 168, "occurredAt": "2026-08-24T01:40:43+00:00", "category": { "value": "session", "rawValue": "session", "known": true }, "eventKind": "hermes_registered_session_handle.changed", "aggregateType": "hermes_registered_session_handle", "aggregateId": "hermes-handle-01", "summary": "Hermes session handle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-007" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-008", "workspaceOrdinal": 8, "sourceEventSequence": 171, "occurredAt": "2026-08-24T01:41:12+00:00", "category": { "value": "unknown", "rawValue": "future_runtime_note", "known": false }, "eventKind": "context.update_appended", "aggregateType": "context_update", "aggregateId": "context-update-demo", "summary": "Platform event observed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-008" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-009", "workspaceOrdinal": 9, "sourceEventSequence": 183, "occurredAt": "2026-08-24T01:42:17+00:00", "category": { "value": "dispatch", "rawValue": "dispatch", "known": true }, "eventKind": "agent_dispatch.changed", "aggregateType": "agent_dispatch", "aggregateId": "dispatch-demo-02", "summary": "Dispatch projection changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-009" },
+          { "schema": "console_timeline_event.v1", "eventId": "demo-event-010", "workspaceOrdinal": 10, "sourceEventSequence": 184, "occurredAt": "2026-08-24T01:42:18+00:00", "category": { "value": "lifecycle", "rawValue": "lifecycle", "known": true }, "eventKind": "run_session.changed", "aggregateType": "run_session", "aggregateId": "run-demo-01", "summary": "Run-session lifecycle changed", "presentationNodeKey": "beacon.console.timeline-event.v1/demo-event-010" }
+        ],
+        "page": { "cursor": null, "nextCursor": "ord:10", "limit": 50, "returned": 10, "total": 10, "hasMore": false, "truncated": false, "cursorOutOfRange": false, "rebuildRequired": false },
+        "replay": { "order": "workspaceOrdinal_asc_eventId_asc", "duplicateEventIdPolicy": "first_sequence_wins", "reconnect": "resume_from_nextCursor_or_rebuild_on_token_change", "rebuildToken": "demo-v1-anchor-001", "deterministicRebuild": true, "polling": "bounded_get_polling_no_stream_claim" }
+      },
+      "limitations": [
+        "No prompt, transcript, provider database, credential, or raw event payload is exposed.",
+        "No prompt, resume, cancel, steer, supplement, approval, reply, queue, config, or provider tool method exists.",
+        "Presentation hosts do not own foreign Provider sessions or Provider-native identities.",
+        "Loopback host checks are not authentication."
+      ]
+    }
+  }
+}

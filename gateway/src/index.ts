@@ -1,15 +1,19 @@
 import { DefaultGatewayService } from "./application/services/gateway-service.js";
 import { ContractOnlyLocalPlatformApiAdapter } from "./application/services/local-platform-api-service.js";
+import { DisconnectedConsoleProjectionAdapter } from "./application/services/console-api-service.js";
 import { PlaceholderHealthService } from "./application/services/health-service.js";
 import type { GatewayConfig } from "./infrastructure/config/env.js";
 import type { LocalPlatformApiAdapter } from "./application/dto/local-platform-api-contract.js";
+import type { ConsoleProjectionAdapter } from "./application/dto/console-api-contract.js";
 import { PythonCoreClient } from "./infrastructure/bridge/python-core-client.js";
 import { PythonLocalPlatformApiAdapter } from "./infrastructure/bridge/python-local-platform-api-adapter.js";
+import { PythonConsoleProjectionAdapter } from "./infrastructure/bridge/python-console-projection-adapter.js";
 import { loadGatewayConfig } from "./infrastructure/config/env.js";
 import { createAgentsRoute } from "./infrastructure/http/routes/agent-route.js";
 import { createHealthRoute } from "./infrastructure/http/routes/health-route.js";
 import { createModelsRoute } from "./infrastructure/http/routes/models-route.js";
 import { createLocalPlatformApiRoutes } from "./infrastructure/http/routes/local-platform-route.js";
+import { createConsoleProjectionRoutes } from "./infrastructure/http/routes/console-route.js";
 import { createSingleTurnPlatformInvocationRoute } from "./infrastructure/http/routes/platform-invocation-route.js";
 import { createTaskRoute } from "./infrastructure/http/routes/task-route.js";
 import { createHttpServer, type HttpServer } from "./infrastructure/http/server.js";
@@ -26,6 +30,7 @@ export const buildGateway = async (): Promise<GatewayRuntime> => {
   const runtimeClient = new PythonCoreClient(protocol, config.runtimeEndpoint);
   const gatewayService = new DefaultGatewayService(runtimeClient);
   const localPlatformApiAdapter = createLocalPlatformApiAdapter(config);
+  const consoleProjectionAdapter = createConsoleProjectionAdapter(config);
   const healthService = new PlaceholderHealthService();
   const server = createHttpServer(config.host, config.port);
 
@@ -40,11 +45,21 @@ export const buildGateway = async (): Promise<GatewayRuntime> => {
   })) {
     await server.registerRoute(route);
   }
+  for (const route of createConsoleProjectionRoutes(consoleProjectionAdapter)) {
+    await server.registerRoute(route);
+  }
 
   return {
     config,
     server,
   };
+};
+
+const createConsoleProjectionAdapter = (config: GatewayConfig): ConsoleProjectionAdapter => {
+  if (config.localPlatformBridge.mode === "python_cli") {
+    return new PythonConsoleProjectionAdapter(config.localPlatformBridge);
+  }
+  return new DisconnectedConsoleProjectionAdapter();
 };
 
 const createLocalPlatformApiAdapter = (config: GatewayConfig): LocalPlatformApiAdapter => {

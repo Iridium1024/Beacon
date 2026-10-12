@@ -331,6 +331,21 @@ class SqlitePlatformEventLog(PlatformEventLogPort):
             raise RuntimeError("SQLite did not return a platform event sequence.")
         return int(sequence)
 
+    def append_in_transaction(self, record: PlatformEventRecord) -> int:
+        """Insert an old-domain fact inside a caller-owned SQLite UoW.
+
+        The ordinary append retains its historical commit behavior. New
+        communication integration uses this explicit method only when a
+        platform fact, such as a grant consumption, must commit with the core
+        message. It must never run provider I/O inside the caller transaction.
+        """
+        if not self.connection.in_transaction:
+            raise RuntimeError("transactional platform append requires an active caller transaction")
+        cursor = self.connection.execute(SQLITE_PLATFORM_EVENT_INSERT_SQL, record.to_sqlite_row())
+        if cursor.lastrowid is None:
+            raise RuntimeError("SQLite did not return a platform event sequence.")
+        return int(cursor.lastrowid)
+
     def list_workspace_events(self, workspace_id: WorkspaceId) -> tuple[PlatformEventLogEntry, ...]:
         _require_non_empty(workspace_id.value, "workspace_id")
         rows = self.connection.execute(

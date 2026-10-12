@@ -33,20 +33,43 @@ def build_beacon_cli_invocation(
 def build_agent_cli_actions(
     *, database_path: str, workspace_root: str, plugins_directory: str,
     profile_path: str | None, workspace_id: str, exchange_request_id: str,
-    target_agent_id: str,
+    target_agent_id: str, core_mode: bool = False,
 ) -> dict[str, object]:
     common, environment = build_beacon_cli_invocation(
         database_path=database_path, workspace_root=workspace_root,
         plugins_directory=plugins_directory, profile_path=profile_path,
     )
     scope = ["--workspace-id", workspace_id]
+    if core_mode:
+        return {
+            "schema": "agent_wake_action.core.v1",
+            "runtimeConfigSource": "profile" if profile_path is not None else "explicit_args",
+            **({"profilePath": profile_path} if profile_path is not None else {}),
+            "runtimeEnvironment": environment,
+            "inspectArgv": [*common, "agent-message-status", *scope,
+                            "--agent-id", target_agent_id, "--message-id", exchange_request_id],
+            "messageGetArgv": [*common, "agent-message-get", *scope,
+                               "--agent-id", target_agent_id, "--message-id", exchange_request_id],
+            "ackArgv": [*common, "agent-message-ack", *scope,
+                        "--agent-id", target_agent_id, "--message-id", exchange_request_id],
+            "selfArgv": [*common, "agent-onboarding-status", *scope, "--agent-id", target_agent_id],
+            "membersArgv": [*common, "agent-onboarding-status", *scope],
+            "inboxArgv": [*common, "agent-message-inbox", *scope, "--agent-id", target_agent_id],
+            "respondArgvTemplate": [*common, "agent-reply", *scope,
+                                    "--request", exchange_request_id, "--agent", target_agent_id,
+                                    "--message", "<short target-agent response>"],
+            "sendArgvTemplate": [*common, "agent-dispatch-send", *scope,
+                                 "--as", "<confirmed-source-alias>", "--to", "<target-alias>",
+                                 "--message", "<new request>"],
+        }
     return {
         "schema": "agent_wake_action.v1",
         "runtimeConfigSource": "profile" if profile_path is not None else "explicit_args",
         **({"profilePath": profile_path} if profile_path is not None else {}),
         "runtimeEnvironment": environment,
         "inspectArgv": [*common, "agent-exchange-status", *scope,
-                        "--exchange-request-id", exchange_request_id, "--format", "compact"],
+                        "--exchange-request-id", exchange_request_id, "--agent-id", target_agent_id,
+                        "--format", "compact"],
         "respondArgvTemplate": [*common, "agent-reply", *scope, "--request", exchange_request_id,
                                 "--agent", target_agent_id, "--message", "<short target-agent response>"],
         "selfArgv": [*common, "agent-onboarding-status", *scope, "--agent-id", target_agent_id],

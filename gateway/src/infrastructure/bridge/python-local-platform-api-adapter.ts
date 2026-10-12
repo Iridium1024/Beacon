@@ -57,9 +57,11 @@ type CliFailure = Error & {
 };
 
 export class PythonLocalPlatformApiAdapter implements LocalPlatformApiAdapter {
-  private selectedPython?: Promise<GatewayPythonInvocation>;
+  private readonly runner: PythonLocalRuntimeCommandRunner;
 
-  public constructor(private readonly config: GatewayLocalPlatformBridgeConfig) {}
+  public constructor(config: GatewayLocalPlatformBridgeConfig) {
+    this.runner = new PythonLocalRuntimeCommandRunner(config);
+  }
 
   public async createWorkspace(
     request: CreateLocalWorkspaceRequest,
@@ -395,6 +397,17 @@ export class PythonLocalPlatformApiAdapter implements LocalPlatformApiAdapter {
   }
 
   private async run<TResponse extends object>(commandArgs: string[]): Promise<TResponse> {
+    return this.runner.run<TResponse>(commandArgs);
+  }
+}
+
+/** Shared structured-JSON CLI carrier. It has no knowledge of read or write operations. */
+export class PythonLocalRuntimeCommandRunner {
+  private selectedPython?: Promise<GatewayPythonInvocation>;
+
+  public constructor(private readonly config: GatewayLocalPlatformBridgeConfig) {}
+
+  public async run<TResponse extends object>(commandArgs: string[]): Promise<TResponse> {
     const python = await this.pythonInvocation();
     const args = [
       ...python.args,

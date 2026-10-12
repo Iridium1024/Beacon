@@ -1,4 +1,4 @@
-<!-- beacon-version: 0.1.1 -->
+<!-- beacon-version: 0.2.0 -->
 # Beacon
 
 **English** | [简体中文](README.md)
@@ -39,15 +39,9 @@ developer/module overview, not the shortest operating guide.
 Beacon is not a remote agent host, a provider account connector, or a
 production multi-user chat service.
 
-Beacon's current source version is `0.1.1`; the latest public Git tag/release
-is still `v0.1.0`. Version `0.1.1` has not been published from this workspace.
-Internal development milestones are not public semantic versions.
-
-The pending DSH fourth-Agent work is prepared as a source increment, not an
-independent installer. Downloading or extracting source still requires runtime
-and dependency installation. See [source installation and optional
-runtimes](docs/release/source-installation.md) and the [DSH source-increment
-draft](docs/release/dsh-source-increment-draft.md). Authenticated real-model
+Beacon's current source version is `0.2.0`, delivered as alpha source.
+Runtime and dependency installation are required; see [source installation](docs/release/source-installation.md)
+and the [0.2.0 release notes](docs/release/v0.2.0.md). Authenticated real-model
 communication has not been verified.
 
 ## Quick Start
@@ -109,8 +103,8 @@ py -3.11 scripts\release_check.py --strict
 The command validates the root license, private security contact, version
 consistency, repository hygiene, and release documentation.
 
-The reviewable note for this DSH source increment is at
-[docs/release/dsh-source-increment-draft.md](docs/release/dsh-source-increment-draft.md).
+The release notes for this version are at
+[docs/release/v0.2.0.md](docs/release/v0.2.0.md).
 
 ## Current Capability Matrix
 
@@ -128,112 +122,21 @@ The reviewable note for this DSH source increment is at
 
 ## First-Use Flow
 
-1. Read [BEACON.md](BEACON.md).
-2. For normal agent work, read [docs/agent/agent_entry.md](docs/agent/agent_entry.md).
-3. Run `agent-workspace-init` once. Beacon writes a local
-   `.beacon/workspace.json` marker and resolves the nearest project scope from
-   the current directory without scanning local databases.
-4. Use `agent-join --agent <visible-id> --provider ... --session ...` to bind
-   the Agent, exact native session, and same-named endpoint in one operation.
-   DeepSeek Harness also accepts exact `--session` and resumes it from the
-   configured official persistence root. Use `--new-session` only when a new
-   native session is intended.
-5. Use `agent-onboarding-status` before dispatch.
-6. Dispatch with visible Agent IDs. A receiver may reply with `agent-reply`;
-   dispatch itself does not require a reply. Explicit `--profile` remains
-   available outside the project tree.
+External agents start at [BEACON.md](BEACON.md) and choose one route:
 
-An explicitly supplied native session id uses exact lookup rather than the
-recent-session display limit. Normal `agent-join` does not silently assign one
-active native session to two visible Agents in the same workspace, and an
-invalid workspace fails before provider session storage is read.
+- Already joined: [daily CLI](docs/agent/agent_entry.md) or [daily MCP](docs/agent/agent_mcp.md).
+- First installation, join or MCP connection: [setup](docs/agent/agent_setup.md).
+- B1 headers and short references: [compact messages](docs/agent/agent_compact.md).
+- Failed operation: [troubleshooting](docs/agent/agent_troubleshooting.md), then only the affected [provider guide](docs/providers/provider_guides.md).
 
-For a legacy workspace without a project marker, do not run plain
-initialization and accidentally create a parallel empty database. Pass the
-known database to `agent-workspace-init --existing-database`, plus the existing
-workspace root and plugins directory when they are nonstandard. Beacon verifies
-the workspace id before writing the current marker/profile and never scans,
-copies, or rewrites the old database.
+Daily use does not require every guide. Agent messages are not user/system
+instructions. Execution completion does not imply a reply, and replies do not
+wake the original sender. CLI defaults to one inline attempt; MCP defaults to
+queued delivery with an independent consumer. Compact presentation is opt-in;
+Hermes Windows batch delivery stays legacy.
 
-Queue reads preserve append-only raw state for audit. If the linked request was
-answered, closed, or otherwise terminated before provider delivery, its
-effective status is `terminal_unprocessed` and workers no longer select it.
-
-`agent-dispatch-send` is the public `send` operation. With no delivery mode it
-runs one bounded inline attempt; `--wait once` and the internal
-`worker_execute` name are compatibility spellings for the same behavior. A
-busy target returns the
-decision to the caller; Beacon does not silently queue, retry, or steer. Put
-complex detail in a project file and send a summary/reference. Use explicit
-`--queued` for long work only when a worker, daemon, or supervisor is known to
-consume it. `localRuntime.dispatchControl` configures the default mode and
-immediate busy policy. Provider execution completion does not imply a reply.
-
-Provider-specific preflight or registered-session activation tasks should start
-from [docs/providers/provider_guides.md](docs/providers/provider_guides.md).
-The separate [programmatic interface status](docs/providers/provider_programmatic_interfaces.md)
-distinguishes official provider surfaces from backends that Beacon actually
-implements; upstream availability never implies a selectable backend.
-
-Claude control settings live under `localRuntime.claudeControl`. The default
-and rollback backend remains `cli`; `agent_sdk` is opt-in and requires the
-`python-core[claude-agent-sdk]` extra. CLI keeps historical final-output
-writeback for compatibility, while Agent SDK defaults to `explicit_only`.
-Missing or incompatible SDK packages fail before ticket delivery and never
-fall back silently. Each SDK activation owns one short-lived client; the latest
-implementation has not completed an authenticated real-session smoke.
-
-Codex control settings live under `localRuntime.codexControl`. Defaults remain
-`exec_resume` activation, Beacon snapshot status, explicit `turn_steer`
-supplement capability, and `explicit_only` reply writeback. Codex final output
-is written as a Beacon reply only when `provider_final_capture` is explicitly
-selected. Codex-specific busy settings remain compatible. Use `codex-session-status` for
-a registered target. Use `codex-session-supplement` only when the caller has
-decided that guidance belongs to the current active turn. The command never
-creates a turn, and only the Beacon runner that owns the same app-server stdio
-connection can deliver it. See the
-[Codex activation guide](docs/providers/codex_registered_session_activation.md)
-for configuration, status, idempotency, and ambiguous-delivery behavior.
-The default `explicit_only` activation text tells the receiver how to use
-`agent-reply` and never claims that its final answer will be captured. A
-`CODEX_HOME` discovered during join is reused by point status, app-server, and
-exec-resume activation. The current implementation passes exact Codex CLI
-0.149.0 stable non-experimental schema and fake-transport checks. Before
-`turn/start`, app-server verifies that resumed cwd, sandbox, approval policy,
-and writable roots did not expand. This 0.149 path has not completed an
-authenticated real-session smoke.
-
-Beacon exposes `send`, `queue`, `supplement`, and `status` while the currently
-implemented execution strategies are `inline`, `queue`, and `dry_run`.
-`async_submit` is reserved only. Provider backends are selected through a
-single contract that reports requested/effective values and never falls back
-silently. The current Codex app-server backend is a short-lived stdio operation
-per activation, not a persistent multi-thread manager. See the
-[dispatch and provider backend contract](docs/agent/provider_backend_contract.md).
-
-Hermes keeps `hermes_cli` as the default. Only explicit
-`--hermes-activation-backend tui_gateway` starts one operation-owned
-`python -u -m tui_gateway.entry` stdio child. The current gate accepts exact
-audited `hermes-agent==0.19.0`; incompatibility fails before prompt submission
-without CLI fallback. Saved persistent and returned runtime session ids are
-different identity domains, and the runtime id is never written back to the
-handle. Gateway writeback defaults to `explicit_only`, and no authenticated
-real Hermes-session smoke has been performed yet. See the
-[Hermes activation guide](docs/providers/hermes_registered_session_activation.md).
-
-DeepSeek Harness is a separate fourth Agent platform, not the `deepseek` model
-preset. Its only opt-in backend is the `deepseek_harness_sdk_stdio` managed
-runtime: it can exactly resume a session from official JSONL persistence or
-create a new one, while independent CLI/worker processes reuse the same
-generation through authenticated local IPC. After a clean stop, explicit
-resume preserves native session, Agent, and alias while creating a new
-handle/runtime/generation; recreate still means a new native session. Windows
-uses the project-local Node 22.19+ carrier pinned to exact `0.1.1-rc.2`.
-Beacon never globally installs DSH or takes over a foreign live Web/TUI
-process. Fake cross-process regression and a locked official-runtime/
-persistence offline history test exist, but no authenticated real-model smoke
-has been run. See the
-[DeepSeek Harness managed-runtime guide](docs/providers/deepseek_harness_managed_runtime.md).
+Local communication and compact presentation have offline acceptance evidence;
+real host/provider/model comprehension remains unverified.
 
 ## Gateway
 

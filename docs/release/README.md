@@ -7,10 +7,9 @@ sessions.
 The first alpha release remains archived in [v0.1.0.md](v0.1.0.md). Historical
 notes not included in this source increment are not release prerequisites.
 
-The pending DSH fourth-Agent source-only increment is documented separately:
-[source installation and optional runtimes](source-installation.md) and the
-[reviewable release-note draft](dsh-source-increment-draft.md). Neither file
-creates a GitHub Release, a tag, or a standalone installer.
+Current source release: [v0.2.0](v0.2.0.md). Follow
+[source installation and optional runtimes](source-installation.md).
+The source archive is not a standalone installer.
 
 ```powershell
 py -3.11 scripts\check_versions.py

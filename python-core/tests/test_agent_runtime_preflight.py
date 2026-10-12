@@ -18,6 +18,7 @@ if str(PROJECT_SRC) not in sys.path:
 from agent_os.application.services.agent_runtime_preflight import (
     build_agent_runtime_preflight_report,
     check_agent_runtime_tool,
+    probe_codex_app_server_surface,
 )
 
 
@@ -112,6 +113,14 @@ class AgentRuntimePreflightTests(unittest.TestCase):
             self.assertTrue(capabilities["subprocessAllowed"]["allowed"])
             self.assertTrue(capabilities["platformCliRunnable"]["runnable"])
             self.assertIn("codex", capabilities["providerExecutableFound"])
+            self.assertEqual(
+                capabilities["providerProtocolChecks"]["codexAppServer"]["schema"],
+                "codex_app_server_preflight.v1",
+            )
+            claude_sdk = capabilities["providerProtocolChecks"]["claudeAgentSdk"]
+            self.assertEqual(claude_sdk["schema"], "claude_agent_sdk_preflight.v1")
+            self.assertEqual(claude_sdk["status"], "not_requested")
+            self.assertFalse(claude_sdk["sessionStarted"])
             self.assertFalse(profile["selected"])
             self.assertEqual(profile["selectionSource"], "default_no_permission_profile")
             self.assertFalse(profile["permissionPostureChangingArgsInjected"])
@@ -120,6 +129,58 @@ class AgentRuntimePreflightTests(unittest.TestCase):
                 "--dangerously-bypass-approvals-and-sandbox",
                 profile["dangerousBypassArgs"],
             )
+
+    def test_codex_app_server_surface_probe_reports_required_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command = _write_fake_app_server_probe(
+                Path(directory),
+                help_lines=(
+                    "Usage: codex app-server [OPTIONS] [COMMAND]",
+                    "generate-json-schema  Generate JSON Schema",
+                    "--listen <URL>  stdio:// (default)",
+                ),
+            )
+
+            result = probe_codex_app_server_surface(
+                str(command),
+                version="0.146.0",
+            )
+
+            self.assertEqual(result["status"], "available")
+            self.assertTrue(result["compatible"])
+            self.assertTrue(result["stdioTransportAvailable"])
+            self.assertTrue(result["jsonSchemaGenerationAvailable"])
+            self.assertEqual(result["version"], "0.146.0")
+
+    def test_codex_app_server_surface_probe_reports_missing_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command = _write_fake_app_server_probe(
+                Path(directory),
+                help_lines=("Usage: codex app-server [OPTIONS]",),
+            )
+
+            result = probe_codex_app_server_surface(str(command))
+
+            self.assertEqual(result["status"], "missing_required_surface")
+            self.assertFalse(result["compatible"])
+            self.assertFalse(result["stdioTransportAvailable"])
+            self.assertFalse(result["jsonSchemaGenerationAvailable"])
+            self.assertIn("warning", result)
+
+    def test_codex_app_server_surface_probe_failure_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command = _write_fake_app_server_probe(
+                Path(directory),
+                help_lines=("app-server unavailable",),
+                exit_code=7,
+            )
+
+            result = probe_codex_app_server_surface(str(command))
+
+            self.assertEqual(result["status"], "probe_failed")
+            self.assertFalse(result["compatible"])
+            self.assertEqual(result["exitCode"], 7)
+            self.assertIn("app-server unavailable", result["error"])
 
     def test_detects_hermes_windows_localappdata_install_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -186,6 +247,12 @@ class AgentRuntimePreflightTests(unittest.TestCase):
                     "claude"
                 ]["selected"]
             )
+            claude_sdk = payload["activationCapabilities"][
+                "providerProtocolChecks"
+            ]["claudeAgentSdk"]
+            self.assertEqual(claude_sdk["schema"], "claude_agent_sdk_preflight.v1")
+            self.assertTrue(claude_sdk["probeAttempted"])
+            self.assertFalse(claude_sdk["sessionStarted"])
 
 
 def _write_fake_tool(
@@ -213,6 +280,32 @@ def _write_fake_tool(
             f"#!/bin/sh\necho {version} >&2\nexit {exit_code}\n",
             encoding="utf-8",
         )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _write_fake_app_server_probe(
+    directory: Path,
+    *,
+    help_lines: tuple[str, ...],
+    exit_code: int = 0,
+) -> Path:
+    if os.name == "nt":
+        path = directory / "codex-app-server-probe.cmd"
+        output = ["@echo off"]
+        for line in help_lines:
+            escaped = line.replace("^", "^^")
+            for character in ("&", "|", "<", ">", "(", ")"):
+                escaped = escaped.replace(character, f"^{character}")
+            output.append(f"echo {escaped}")
+        output.append(f"exit /b {exit_code}")
+        path.write_text("\r\n".join(output) + "\r\n", encoding="utf-8")
+        return path
+    path = directory / "codex-app-server-probe"
+    output = ["#!/bin/sh"]
+    output.extend(f"echo '{line}'" for line in help_lines)
+    output.append(f"exit {exit_code}")
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
 

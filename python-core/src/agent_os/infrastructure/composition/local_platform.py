@@ -106,6 +106,30 @@ class LocalPlatformRuntimeComponents:
     def operations(self) -> LocalPlatformOperationService:
         return build_local_platform_operation_service(self.connection)
 
+    def communication_mode(self, workspace_id: str) -> str:
+        """Read workspace ownership without initializing or migrating schema."""
+        from agent_os.infrastructure.persistence.communication_store import SqliteCommunicationRepository
+        return SqliteCommunicationRepository(self.connection).mode(workspace_id)
+
+    def communication(self, workspace_id: str):
+        """Construct the sole core facade only for an explicitly cut-over workspace."""
+        from agent_os.application.services.communication_core import CommunicationService
+        from agent_os.application.services.communication_compatibility import LegacyExchangeSendCompatibility
+        from agent_os.infrastructure.adapters.communication_directory import PlatformCommunicationDirectory
+        from agent_os.infrastructure.persistence.communication_store import SqliteCommunicationRepository
+        repository = SqliteCommunicationRepository(self.connection)
+        mode = repository.mode(workspace_id)
+        if mode == "legacy":
+            return None
+        if mode != "core":
+            raise ValueError("unsupported workspace communication mode")
+        platform = self.operations()
+        from agent_os.infrastructure.persistence.communication_runtime_store import SqliteRuntimeCoordination
+        return CommunicationService(repository, PlatformCommunicationDirectory(
+            self.connection, platform=platform),
+            send_compatibility=LegacyExchangeSendCompatibility(repository, platform),
+            coordination=SqliteRuntimeCoordination(self.connection, database_id=repository.database_id))
+
     def close(self) -> None:
         self.connection.close()
 
@@ -310,6 +334,7 @@ def build_local_platform_operation_service(
     """Compose local API-wrap-ready platform operations over current state."""
 
     return LocalPlatformOperationService(
+        communication_runtime_query=lambda workspace, now: _communication_consumer_status(connection, workspace, now),
         workspace_reader=SqliteWorkspaceStateStore(connection),
         context_reader=SqliteContextStateStore(connection),
         context_update_recorder=SqliteContextUpdateEventRecorder(connection),
@@ -329,6 +354,16 @@ def build_local_platform_operation_service(
     )
 
 
+def _communication_consumer_status(connection, workspace_id, now):
+    from agent_os.infrastructure.persistence.communication_store import SqliteCommunicationRepository
+    from agent_os.infrastructure.persistence.communication_runtime_store import SqliteRuntimeCoordination
+    repository = SqliteCommunicationRepository(connection)
+    if repository.mode(workspace_id) != "core":
+        return None
+    coordination = SqliteRuntimeCoordination(connection, database_id=repository.database_id)
+    return coordination.consumer_status(workspace_id, now) if coordination.enabled() else None
+
+
 def connect_local_platform_database(database: str | Path) -> sqlite3.Connection:
     if database != ":memory:":
         database_path = Path(database)
@@ -340,3 +375,11 @@ def connect_local_platform_database(database: str | Path) -> sqlite3.Connection:
 
 def _workspace_id(value: WorkspaceId | str) -> WorkspaceId:
     return value if isinstance(value, WorkspaceId) else WorkspaceId(value)
+
+
+def build_communication_directory(connection, *, platform=None):
+    """Explicit assembly seam; directory itself never constructs the platform."""
+    from agent_os.infrastructure.adapters.communication_directory import PlatformCommunicationDirectory
+    from agent_os.infrastructure.adapters.communication_reader import LegacyCommunicationReader
+    return PlatformCommunicationDirectory(reader=LegacyCommunicationReader(
+        platform if platform is not None else build_local_platform_operation_service(connection)))

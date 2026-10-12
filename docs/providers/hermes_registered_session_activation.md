@@ -1,14 +1,18 @@
 # Hermes Registered Session Activation
 
+For ordinary messages use [daily CLI](../agent/agent_entry.md) or
+[daily MCP](../agent/agent_mcp.md). This page is optional setup/troubleshooting
+reference; read only the section for your provider task.
+
 Status: implemented as a bounded provider-specific registered-session adapter.
 
-This document describes the Hermes activation path. It follows the same
-platform pattern as the Claude and Codex registered-session
-adapters: the platform stores a user-approved session handle, writes a wake
-ticket for one directed request, starts the official local CLI in a bounded
-background subprocess, and records append-only audit events.
+This document describes both implemented Hermes activation backends. Beacon
+stores a user-approved saved-session handle, writes one wake ticket, starts one
+short-lived provider process for the operation, and records append-only audit
+events. `cli` remains the default and rollback route. `tui_gateway` is an
+explicit opt-in route pinned to the audited PyPI `hermes-agent==0.19.0` surface.
 
-## Route
+## Default CLI route
 
 The adapter renders:
 
@@ -23,6 +27,83 @@ The adapter does not use `-z` / `--oneshot`, because local help describes that
 mode as automatically bypassing approvals. It also does not use `--yolo`,
 worktree mode, gateway/webhook/send, OAuth/secrets, MCP/ACP server startup,
 desktop input injection, browser input injection, or TUI automation.
+
+## Opt-in TUI Gateway route
+
+The implemented backend id is `hermes_tui_gateway_stdio`. It launches the
+gateway from the same exact Python environment that is preflighted:
+
+```text
+<gateway-python> -u -m tui_gateway.entry
+```
+
+PyPI `0.19.0` supplies the module but no `tui_gateway` console script, so Beacon
+does not invent one. The process is operation-owned stdio JSON-RPC/JSONL. It is
+closed after the activation; Beacon does not connect to a desktop-owned
+gateway, use WebSocket, expose an HTTP endpoint, or keep a persistent runtime.
+
+The only handshake is the `method=event`, `type=gateway.ready` notification.
+Beacon never sends an `initialize` RPC. It then performs this bounded identity
+flow before sending the prompt:
+
+1. `session.list` must contain exactly one row matching the registered
+   persistent session id and registered source.
+2. `session.resume` receives the persistent id. Both `resumed` and
+   `session_key` must return that exact persistent id.
+3. The returned `session_id` is a process-local runtime id. It is expected to
+   differ from the persistent id, is used for submit/events/status/interrupt,
+   and is never written back to the handle registry.
+4. Resume `info.cwd` must match the registered cwd. Stable `0.19.0` does not
+   expose every home/source field in that result, so the audit distinguishes
+   gateway verification from registered-source evidence instead of claiming
+   more than the protocol proves.
+5. `prompt.submit` carries only the runtime id and wake-ticket prompt. Ordinary
+   activation never sends rewind/truncation fields.
+
+Only one matching, non-empty `message.complete` event with
+`payload.status=complete` can be considered a provider final. Deltas, tool
+events, status text, errors, interaction prompts, and other-session text never
+become replies. The TUI Gateway defaults to `explicit_only`; automatic final
+capture is available only through explicit `provider_final_capture` selection
+and still requires the verified identity and terminal-event checks.
+
+Approval, clarification, sudo, and secret prompts are event notifications, not
+generic reverse requests. For stable `0.19.0`, approval is denied through
+`approval.respond` scoped by runtime session id; clarify/sudo/secret responses
+use their event `request_id`. Beacon sends an empty/deny response, never reads or
+supplies a password or secret, fails closed on unknown/duplicate/expired ids,
+and marks interaction-bearing results for user review. Timeout or cancellation
+sends at most one `session.interrupt` before bounded process cleanup.
+
+### Exact-version preflight
+
+`tui_gateway` selection performs a read-only probe before ticket delivery. The
+probe uses the selected interpreter to find the installed `hermes-agent`
+distribution, package version and location, `tui_gateway.entry` and server
+source, and the required method/event surface. Only exact audited `0.19.0` is
+accepted. Local `0.18.0`, missing modules, and unknown/newer versions fail before
+prompt submission and do not silently fall back to `hermes_cli`.
+
+The official `main` branch reported `0.20.5` during the 2026-08-23 audit and has
+already evolved interaction/clarification details. It is advisory evidence,
+not an accepted runtime range. Support for it requires a new pinned capability
+fixture and fake-transport audit.
+
+## Other official programmatic interfaces
+
+Hermes also documents ACP over stdio and an OpenAI-compatible HTTP API Server.
+Neither is selected for this registered-session path. ACP's load/resume/fork
+scope is tied to sessions known by the current ACP server process rather than
+arbitrary saved CLI sessions in the registered `state.db`. The HTTP API Server
+is a separate future remote/runtime-managed path.
+
+ACP is not selected for this registered-session path because its documented
+load/resume/fork scope is tied to sessions known by the current ACP server
+process, rather than arbitrary saved CLI sessions in the registered
+`state.db`. The HTTP API Server is a useful future remote/runtime-managed path,
+but is likewise separate from the current exact local CLI-session contract.
+See [`provider_programmatic_interfaces.md`](provider_programmatic_interfaces.md)
+for the full status matrix and official references.
 
 ## Commands
 
@@ -82,6 +163,24 @@ beacon --profile "<PROFILE_PATH>" `
   --execute
 ```
 
+Opt in to the stable TUI Gateway backend:
+
+```powershell
+beacon --profile "<PROFILE_PATH>" `
+  hermes-registered-session-activate `
+  --agent-id <target-agent-id> `
+  --handle-id <returned-handle-id> `
+  --exchange-request-id <request-id> `
+  --hermes-activation-backend tui_gateway `
+  --hermes-gateway-python "<python-from-hermes-0.19.0-environment>" `
+  --execute
+```
+
+Add `--hermes-reply-writeback-mode provider_final_capture` only when automatic
+capture is explicitly desired. Omitting it gives `explicit_only` for the
+gateway. The CLI backend retains historical provider-final capture unless
+overridden with `--hermes-reply-writeback-mode explicit_only`.
+
 If a custom Hermes executable is needed, pass `--hermes-executable` or
 `--hermes-path`. If omitted, the adapter resolves bare `hermes` through
 `agent-runtime-preflight`. Pass `--hermes-home` during activation only when the
@@ -129,8 +228,8 @@ Hermes, Codex, and Claude registered-session activation alike.
 ## Desktop Hermes
 
 Desktop Hermes can be used by the user to log in and create or confirm a usable
-Hermes session. The platform still activates through the bounded local CLI
-subprocess above. The handle stores the explicitly approved Hermes session id,
+Hermes session. Activation still uses a new bounded CLI or TUI Gateway process;
+it never takes over the desktop process. The handle stores the approved id,
 cwd, and optional runtime-home/source identity. It does not store credentials,
 tokens, cookies, message history, or desktop state.
 
@@ -164,6 +263,11 @@ Activation audit records include:
 - `targetResponseCompleted`
 - `failureCategory`
 - `retryable`
+- `activationBackend=cli|tui_gateway`
+- `replyWritebackMode=explicit_only|provider_final_capture`
+- `providerRuntimeMetadata.preflight` and, after launch,
+  `providerRuntimeMetadata.run`
+- `runtimeSessionId` for the gateway's process-local id
 
 Target Hermes actively running the platform respond command is the stronger
 completion path. Stdout auto-capture is an independent fallback and retains
@@ -178,3 +282,8 @@ activation and its stdout is not recorded as the response. If stdout is usable
 but session continuity cannot be verified, Beacon may preserve it for
 compatibility while setting `responseRequiresUserReview=true` and
 `responseInstanceVerified=false`.
+
+For `tui_gateway`, continuity instead comes from the exact list/resume/cwd
+identity flow. A runtime id differing from the persistent id is normal and is
+not a continuity warning. Gateway stdout is protocol framing, never a response
+capture source.

@@ -27,6 +27,161 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), f"beacon {expected}")
 
+    def test_dispatch_send_defaults_to_wait_once_and_explicit_queue_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = _write_local_runtime_profile(root, "workspace-send-default")
+            created = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "workspace-create",
+                "--workspace-id",
+                "workspace-send-default",
+                "--display-name",
+                "Send Default Workspace",
+                "--agent-id",
+                "agent-a",
+            )
+            target = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-create",
+                "--workspace-id",
+                "workspace-send-default",
+                "--agent-id",
+                "agent-b",
+                "--name",
+                "Agent B",
+                "--description",
+                "Target agent.",
+            )
+            default_send = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-dispatch-send",
+                "--workspace-id",
+                "workspace-send-default",
+                "--source-agent-id",
+                "agent-a",
+                "--target-agent-id",
+                "agent-b",
+                "--target-provider",
+                "codex",
+                "--message",
+                "Confirm receipt.",
+                "--dry-run",
+            )
+            queued_send = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-dispatch-send",
+                "--workspace-id",
+                "workspace-send-default",
+                "--source-agent-id",
+                "agent-a",
+                "--target-agent-id",
+                "agent-b",
+                "--target-provider",
+                "codex",
+                "--message",
+                "Handle this asynchronously.",
+                "--queued",
+                "--dry-run",
+            )
+            claude_sdk_send = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-dispatch-send",
+                "--workspace-id",
+                "workspace-send-default",
+                "--source-agent-id",
+                "agent-a",
+                "--target-agent-id",
+                "agent-b",
+                "--target-provider",
+                "claude",
+                "--message",
+                "Preview Agent SDK inline selection.",
+                "--claude-activation-backend",
+                "agent_sdk",
+                "--dry-run",
+            )
+            hermes_gateway_send = _run_cli_without_runtime_args(
+                "--profile",
+                str(profile),
+                "agent-dispatch-send",
+                "--workspace-id",
+                "workspace-send-default",
+                "--source-agent-id",
+                "agent-a",
+                "--target-agent-id",
+                "agent-b",
+                "--target-provider",
+                "hermes",
+                "--message",
+                "Preview Hermes TUI Gateway selection.",
+                "--hermes-activation-backend",
+                "tui_gateway",
+                "--hermes-gateway-python",
+                sys.executable,
+                "--dry-run",
+            )
+
+            for result in (
+                created,
+                target,
+                default_send,
+                queued_send,
+                claude_sdk_send,
+                hermes_gateway_send,
+            ):
+                self.assertEqual(result.returncode, 0, result.stderr)
+            default_payload = json.loads(default_send.stdout)
+            self.assertEqual(default_payload["deliveryMode"], "worker_execute")
+            self.assertEqual(
+                default_payload["deliveryDecision"]["modeSource"],
+                "default",
+            )
+            self.assertTrue(default_payload["workerRunRequested"])
+            claude_payload = json.loads(claude_sdk_send.stdout)
+            self.assertEqual(
+                claude_payload["claudeControl"]["activationBackend"]["value"],
+                "agent_sdk",
+            )
+            self.assertEqual(
+                claude_payload["claudeControl"]["replyWritebackMode"]["value"],
+                "explicit_only",
+            )
+            self.assertEqual(
+                claude_payload["claudeControl"]["activationBackend"]["source"],
+                "explicit_cli",
+            )
+            hermes_payload = json.loads(hermes_gateway_send.stdout)
+            self.assertEqual(
+                hermes_payload["hermesControl"]["activationBackend"]["value"],
+                "tui_gateway",
+            )
+            self.assertEqual(
+                hermes_payload["hermesControl"]["replyWritebackMode"]["value"],
+                "explicit_only",
+            )
+            self.assertEqual(
+                hermes_payload["hermesControl"]["gatewayPython"]["value"],
+                sys.executable,
+            )
+            self.assertFalse(default_payload["workerExecuted"])
+            self.assertEqual(
+                default_payload["dispatchControl"]["immediateBusyPolicy"]["value"],
+                "return_to_sender",
+            )
+            queued_payload = json.loads(queued_send.stdout)
+            self.assertEqual(queued_payload["deliveryMode"], "queued")
+            self.assertEqual(
+                queued_payload["deliveryDecision"]["modeSource"],
+                "explicit_cli",
+            )
+            self.assertFalse(queued_payload["workerRunRequested"])
+
     def test_python_module_smoke_command_runs_from_empty_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = _run_cli(
@@ -133,8 +288,8 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
             self.assertIn("workspace-onboarding-cli", status.stdout)
             self.assertIn(str(profile.resolve()), status.stdout)
             self.assertIn("ready: false", status.stdout)
-            self.assertIn("nextAction: create_or_onboard_agent", status.stdout)
-            self.assertIn("agent-provider-onboard", status.stdout)
+            self.assertIn("nextAction: join_agent", status.stdout)
+            self.assertIn("agent-join", status.stdout)
             self.assertNotIn("SECRET", status.stdout)
 
     def test_provider_session_profile_can_join_and_leave_multiple_workspaces(
@@ -247,12 +402,13 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
 
             workspace_profiles: dict[str, Path] = {}
             for workspace_id in ("workspace-profile-a", "workspace-profile-b"):
+                workspace_project_root = root / workspace_id
                 initialized = _run_cli_without_runtime_args(
                     "--provider-session-registry",
                     str(registry),
                     "agent-workspace-init",
                     "--project-root",
-                    str(root),
+                    str(workspace_project_root),
                     "--workspace-id",
                     workspace_id,
                     "--display-name",
@@ -882,10 +1038,52 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
                 profile_payload["localRuntime"]["databasePath"],
                 paths["databasePath"],
             )
+            self.assertEqual(
+                profile_payload["localRuntime"]["claudeControl"],
+                {"activationBackend": "cli"},
+            )
+            self.assertEqual(
+                profile_payload["localRuntime"]["codexControl"],
+                {
+                    "activationBackend": "exec_resume",
+                    "statusReadMode": "beacon_snapshot",
+                    "supplementMode": "turn_steer",
+                    "replyWritebackMode": "explicit_only",
+                },
+            )
+            marker_path = Path(paths["projectWorkspaceMarker"])
+            marker_payload = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker_payload["schema"], "beacon_project_workspace.v1")
+            self.assertEqual(marker_payload["workspaceId"], "workspace-profile-init-1")
+            self.assertEqual(marker_payload["databaseScanned"], False)
+            self.assertEqual(
+                profile_payload["localRuntime"]["dispatchControl"],
+                {
+                    "defaultDeliveryMode": "worker_execute",
+                    "immediateBusyPolicy": "return_to_sender",
+                },
+            )
             self.assertTrue(payload["paths"]["doNotCommit"])
             self.assertNotEqual(
                 Path(paths["baseDirectory"]).resolve(strict=False),
                 PROJECT_SRC.parents[1].resolve(strict=False),
+            )
+
+            repeated = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(project_root),
+                "--workspace-id",
+                "workspace-profile-init-1",
+                "--display-name",
+                "Profile Init Workspace",
+            )
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            repeated_payload = json.loads(repeated.stdout)
+            self.assertFalse(repeated_payload["workspaceCreated"])
+            self.assertEqual(
+                repeated_payload["projectWorkspaceScope"]["markerPath"],
+                str(marker_path),
             )
 
             opened = _run_cli_without_runtime_args(
@@ -913,9 +1111,10 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
 
     def test_python_module_workspace_init_isolates_workspace_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project_root = Path(directory) / "multi-project"
+            project_base = Path(directory) / "multi-projects"
             payloads = []
             for workspace_id in ("workspace-alpha", "workspace-beta"):
+                project_root = project_base / workspace_id
                 result = _run_cli_without_runtime_args(
                     "agent-workspace-init",
                     "--project-root",
@@ -949,6 +1148,221 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
                 payloads[1]["paths"]["projectRelativePaths"]["databasePath"],
                 ".beacon/workspaces/workspace-beta/platform.sqlite3",
             )
+
+    def test_project_marker_resolves_profile_without_database_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory) / "marker-project"
+            initialized = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(project_root),
+                "--workspace-id",
+                "workspace-marker",
+                "--display-name",
+                "Marker Workspace",
+            )
+            child = project_root / "src" / "nested"
+            child.mkdir(parents=True)
+            opened = _run_cli_without_runtime_args(
+                "workspace-open",
+                cwd=child,
+            )
+
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            self.assertEqual(opened.returncode, 0, opened.stderr)
+            payload = json.loads(opened.stdout)
+            self.assertEqual(payload["workspace"]["workspaceId"], "workspace-marker")
+            marker = json.loads(
+                (project_root / ".beacon" / "workspace.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertFalse(marker["databaseScanned"])
+
+    def test_workspace_init_explicitly_adopts_existing_database_without_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_project = root / "legacy-project"
+            legacy = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(legacy_project),
+                "--workspace-id",
+                "workspace-legacy",
+                "--display-name",
+                "Legacy Workspace",
+            )
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            legacy_paths = json.loads(legacy.stdout)["paths"]["localAbsolutePaths"]
+
+            adopted_project = root / "adopted-project"
+            adopted = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(adopted_project),
+                "--workspace-id",
+                "workspace-legacy",
+                "--display-name",
+                "Legacy Workspace",
+                "--existing-database",
+                legacy_paths["databasePath"],
+                "--existing-workspace-root",
+                legacy_paths["workspaceRoot"],
+                "--existing-plugins-directory",
+                legacy_paths["pluginsDirectory"],
+            )
+
+            self.assertEqual(adopted.returncode, 0, adopted.stderr)
+            payload = json.loads(adopted.stdout)
+            self.assertFalse(payload["workspaceCreated"])
+            self.assertTrue(payload["existingWorkspaceAdopted"])
+            self.assertFalse(payload["databaseCopied"])
+            self.assertFalse(payload["databaseScanned"])
+            self.assertEqual(
+                payload["paths"]["localAbsolutePaths"]["databasePath"],
+                legacy_paths["databasePath"],
+            )
+            parallel_database = (
+                adopted_project
+                / ".beacon"
+                / "workspaces"
+                / "workspace-legacy"
+                / "platform.sqlite3"
+            )
+            self.assertFalse(parallel_database.exists())
+
+            nested = adopted_project / "src" / "nested"
+            nested.mkdir(parents=True)
+            opened = _run_cli_without_runtime_args("workspace-open", cwd=nested)
+            self.assertEqual(opened.returncode, 0, opened.stderr)
+            self.assertEqual(
+                json.loads(opened.stdout)["workspace"]["workspaceId"],
+                "workspace-legacy",
+            )
+
+    def test_workspace_init_rejects_wrong_existing_workspace_before_marker_write(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy_project = root / "legacy-project"
+            legacy = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(legacy_project),
+                "--workspace-id",
+                "workspace-real",
+                "--display-name",
+                "Real Workspace",
+            )
+            self.assertEqual(legacy.returncode, 0, legacy.stderr)
+            database_path = json.loads(legacy.stdout)["paths"][
+                "localAbsolutePaths"
+            ]["databasePath"]
+            adopted_project = root / "adopted-project"
+
+            rejected = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(adopted_project),
+                "--workspace-id",
+                "workspace-wrong",
+                "--display-name",
+                "Wrong Workspace",
+                "--existing-database",
+                database_path,
+            )
+
+            self.assertEqual(rejected.returncode, 1)
+            self.assertFalse(
+                (adopted_project / ".beacon" / "workspace.json").exists()
+            )
+
+    def test_project_marker_rejects_profile_and_workspace_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_root = root / "first"
+            second_root = root / "second"
+            first = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(first_root),
+                "--workspace-id",
+                "workspace-first",
+                "--display-name",
+                "First",
+            )
+            second = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(second_root),
+                "--workspace-id",
+                "workspace-second",
+                "--display-name",
+                "Second",
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_profile = json.loads(second.stdout)["profile"]["path"]
+
+            profile_conflict = _run_cli_without_runtime_args(
+                "--profile",
+                second_profile,
+                "workspace-open",
+                cwd=first_root,
+            )
+            environment_conflict = _run_cli_without_runtime_args(
+                "workspace-open",
+                cwd=first_root,
+                extra_env={
+                    "AGENT_OS_LOCAL_RUNTIME_PROFILE": second_profile,
+                },
+            )
+            marker_conflict = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(first_root),
+                "--workspace-id",
+                "workspace-other",
+                "--display-name",
+                "Other",
+            )
+
+            self.assertEqual(profile_conflict.returncode, 1)
+            self.assertIn("workspace_scope_conflict", profile_conflict.stderr)
+            self.assertEqual(environment_conflict.returncode, 1)
+            self.assertIn("workspace_scope_conflict", environment_conflict.stderr)
+            self.assertEqual(marker_conflict.returncode, 1)
+            self.assertIn("workspace_scope_conflict", marker_conflict.stderr)
+
+    def test_project_marker_rejects_internal_workspace_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = Path(directory) / "marker-mismatch"
+            initialized = _run_cli_without_runtime_args(
+                "agent-workspace-init",
+                "--project-root",
+                str(project_root),
+                "--workspace-id",
+                "workspace-marker-original",
+                "--display-name",
+                "Marker Original",
+            )
+            self.assertEqual(initialized.returncode, 0, initialized.stderr)
+            marker_path = project_root / ".beacon" / "workspace.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker["workspaceId"] = "workspace-marker-tampered"
+            marker_path.write_text(
+                json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            opened = _run_cli_without_runtime_args(
+                "workspace-open",
+                cwd=project_root,
+            )
+
+            self.assertEqual(opened.returncode, 1)
+            self.assertIn("workspace_scope_conflict", opened.stderr)
 
     def test_python_module_accepts_workspace_id_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1479,7 +1893,7 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
                 handoff["requestReadCommand"],
             )
             self.assertIn(
-                "agent-exchange-request-respond",
+                "agent-reply",
                 handoff["respondCommandTemplate"],
             )
             self.assertIn("--profile", send_payload["statusCommand"])
@@ -2754,16 +3168,17 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
             self.assertEqual(ticket["schema"], "agent_wake_ticket.v2")
             action = ticket["recommendedAction"]
             self.assertEqual(action["runtimeConfigSource"], "explicit_args")
-            self.assertEqual(action["inspectArgv"][0], sys.executable)
+            self.assertEqual(Path(action["inspectArgv"][0]).resolve(), Path(sys.executable).resolve())
             self.assertEqual(
                 action["inspectArgv"][1:3],
                 ["-m", "agent_os.local_runtime"],
             )
             self.assertIn("PYTHONPATH", action["runtimeEnvironment"])
             self.assertNotIn("recommendedCli", ticket)
+            self.assertIn("agent-reply", action["respondArgvTemplate"])
             responding_agent_index = action[
                 "respondArgvTemplate"
-            ].index("--responding-agent-id")
+            ].index("--agent")
             self.assertEqual(
                 action["respondArgvTemplate"][
                     responding_agent_index + 1
@@ -2942,14 +3357,14 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
             )
             responded = _run_cli(
                 directory,
-                "agent-exchange-request-respond",
+                "agent-reply",
                 "--workspace-id",
                 workspace_id,
-                "--exchange-request-id",
+                "--request",
                 "req-daemon-recovery-1",
-                "--responding-agent-id",
+                "--agent",
                 target_agent_id,
-                "--response-summary",
+                "--message",
                 "Durable response available after daemon restart.",
             )
             preview = _run_cli(
@@ -3148,6 +3563,20 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
                 "--wait",
                 "--codex-git-repo-check-policy",
                 "strict",
+                "--claude-activation-backend",
+                "agent_sdk",
+                "--claude-reply-writeback-mode",
+                "explicit_only",
+                "--codex-activation-backend",
+                "app_server",
+                "--codex-busy-delivery-policy",
+                "reject",
+                "--hermes-activation-backend",
+                "tui_gateway",
+                "--hermes-reply-writeback-mode",
+                "explicit_only",
+                "--hermes-gateway-python",
+                sys.executable,
                 "--poll-interval-ms",
                 "1",
             )
@@ -3183,6 +3612,37 @@ class LocalRuntimeEntrypointTests(unittest.TestCase):
             self.assertNotIn("--profile " + resolved_profile, started_payload["argv"])
             self.assertIn("--codex-git-repo-check-policy", started_payload["argv"])
             self.assertIn("strict", started_payload["argv"])
+            self.assertIn("--codex-activation-backend", started_payload["argv"])
+            self.assertIn("--claude-activation-backend", started_payload["argv"])
+            self.assertIn("--hermes-activation-backend", started_payload["argv"])
+            hermes_backend_index = started_payload["argv"].index(
+                "--hermes-activation-backend"
+            )
+            self.assertEqual(
+                started_payload["argv"][hermes_backend_index + 1],
+                "tui_gateway",
+            )
+            self.assertIn("--hermes-gateway-python", started_payload["argv"])
+            claude_backend_index = started_payload["argv"].index(
+                "--claude-activation-backend"
+            )
+            self.assertEqual(
+                started_payload["argv"][claude_backend_index + 1],
+                "agent_sdk",
+            )
+            self.assertIn(
+                "--claude-reply-writeback-mode",
+                started_payload["argv"],
+            )
+            backend_index = started_payload["argv"].index(
+                "--codex-activation-backend"
+            )
+            self.assertEqual(started_payload["argv"][backend_index + 1], "app_server")
+            self.assertIn("--codex-busy-delivery-policy", started_payload["argv"])
+            busy_index = started_payload["argv"].index(
+                "--codex-busy-delivery-policy"
+            )
+            self.assertEqual(started_payload["argv"][busy_index + 1], "reject")
             self.assertIn("--runtime-status-policy", started_payload["argv"])
             policy_index = started_payload["argv"].index("--runtime-status-policy")
             self.assertEqual(started_payload["argv"][policy_index + 1], "auto")
@@ -4173,15 +4633,18 @@ def _run_cli(
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=90,
     )
 
 
 def _run_cli_without_runtime_args(
     *args: str,
     extra_env: Mapping[str, str] | None = None,
+    cwd: str | Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(PROJECT_SRC)
+    environment.pop("AGENT_OS_LOCAL_RUNTIME_PROFILE", None)
     if extra_env is not None:
         environment.update(extra_env)
     return subprocess.run(
@@ -4191,13 +4654,14 @@ def _run_cli_without_runtime_args(
             "agent_os.local_runtime",
             *args,
         ],
-        cwd=str(PROJECT_SRC.parents[1]),
+        cwd=str(cwd or PROJECT_SRC.parents[1]),
         env=environment,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
         check=False,
+        timeout=90,
     )
 
 

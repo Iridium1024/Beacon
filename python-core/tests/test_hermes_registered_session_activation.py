@@ -26,6 +26,10 @@ from agent_os.application.services.hermes_registered_session import (
     render_hermes_chat_resume_argv,
     resolve_hermes_executable,
 )
+from agent_os.application.services.hermes_tui_gateway_backend import (
+    HermesTuiGatewayRunResult,
+    HermesTuiGatewayRuntime,
+)
 from agent_os.application.services.local_platform_operations import (
     LocalPlatformOperationService,
 )
@@ -185,6 +189,201 @@ class HermesRegisteredSessionContractTests(unittest.TestCase):
 
 
 class HermesRegisteredSessionOperationTests(unittest.TestCase):
+    def test_tui_gateway_incompatible_preflight_fails_before_delivery_without_cli_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(connection)
+            _seed_workspace(service)
+            session_id = str(uuid4())
+            service.register_hermes_session_handle(
+                "workspace-hermes",
+                agent_id="agent-b",
+                handle_id="hermes-handle-gateway-rejected",
+                hermes_session_id=session_id,
+                cwd=str(root),
+                created_by="user",
+                reason="explicit gateway registration",
+                metadata={
+                    "hermesSessionIdentity": {
+                        "schema": "hermes_session_identity.v1",
+                        "providerSessionId": session_id,
+                        "runtimeHome": str(root),
+                        "runtimeHomeSource": "explicit",
+                        "sessionSource": "cli",
+                        "fullSessionHistoryRead": False,
+                    }
+                },
+            )
+            runtime = HermesTuiGatewayRuntime(
+                status="unsupported_version",
+                compatible=False,
+                python_executable="gateway-python",
+                package_version="0.20.5",
+                error="exact stable version required",
+            )
+
+            with mock.patch(
+                "agent_os.application.services.local_platform_operations."
+                "load_hermes_tui_gateway_runtime",
+                return_value=runtime,
+            ), mock.patch(
+                "agent_os.application.services.local_platform_operations."
+                "run_hermes_tui_gateway_activation",
+            ) as run_gateway:
+                result = service.activate_hermes_registered_session(
+                    "workspace-hermes",
+                    agent_id="agent-b",
+                    handle_id="hermes-handle-gateway-rejected",
+                    exchange_request_id="req-hermes-1",
+                    database_path=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "workspace"),
+                    plugins_directory=str(root / "plugins"),
+                    handoff_directory=str(root / "handoff"),
+                    activation_backend="tui_gateway",
+                    gateway_python="gateway-python",
+                    dry_run=False,
+                )
+
+            activation = result["hermesRegisteredSessionActivation"]
+            selection = result["providerBackendSelection"]
+            self.assertEqual(activation["status"], "failed")
+            self.assertEqual(
+                activation["failureCategory"],
+                "hermes_tui_gateway_unsupported_version",
+            )
+            self.assertFalse(activation["providerCommandStarted"])
+            self.assertEqual(
+                selection["effectiveBackend"],
+                "hermes_tui_gateway_stdio",
+            )
+            self.assertFalse(selection["fallbackApplied"])
+            self.assertEqual(_wake_event_count(connection), 0)
+            self.assertFalse(Path(activation["ticketPath"]).exists())
+            run_gateway.assert_not_called()
+
+    def test_tui_gateway_execute_uses_exact_preflight_and_explicit_only_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(connection)
+            _seed_workspace(service)
+            session_id = str(uuid4())
+            service.register_hermes_session_handle(
+                "workspace-hermes",
+                agent_id="agent-b",
+                handle_id="hermes-handle-gateway",
+                hermes_session_id=session_id,
+                cwd=str(root),
+                created_by="user",
+                reason="explicit gateway registration",
+                metadata={
+                    "hermesSessionIdentity": {
+                        "schema": "hermes_session_identity.v1",
+                        "providerSessionId": session_id,
+                        "runtimeHome": str(root),
+                        "runtimeHomeSource": "explicit",
+                        "sessionSource": "cli",
+                        "fullSessionHistoryRead": False,
+                    }
+                },
+            )
+            runtime = HermesTuiGatewayRuntime(
+                status="available",
+                compatible=True,
+                python_executable="gateway-python",
+                package_version="0.19.0",
+                package_location=str(root),
+                gateway_entry_location=str(root / "entry.py"),
+                server_location=str(root / "server.py"),
+                launch_argv=("gateway-python", "-u", "-m", "tui_gateway.entry"),
+                methods={"session.resume": True},
+                events={"gateway.ready": True},
+                capabilities={"version": "0.19.0"},
+            )
+            gateway_result = HermesTuiGatewayRunResult(
+                status="completed",
+                package_version="0.19.0",
+                provider_command_started=True,
+                prompt_submission_attempted=True,
+                prompt_submitted=True,
+                session_continuity_verified=True,
+                persistent_session_id=session_id,
+                runtime_session_id="runtime-abcd",
+                event_counts={"gateway.ready": 1, "message.complete": 1},
+                identity_evidence={
+                    "sessionListSourceVerified": True,
+                    "resumePersistentIdVerified": True,
+                    "cwdVerification": "verified",
+                },
+                final_response="gateway final is not auto-written by default",
+                final_response_source="gateway_event.message.complete",
+                terminal_status="complete",
+                cleanup_status="terminated",
+                exit_code=0,
+                wire_methods=("session.list", "session.resume", "prompt.submit"),
+            )
+
+            with mock.patch(
+                "agent_os.application.services.local_platform_operations."
+                "load_hermes_tui_gateway_runtime",
+                return_value=runtime,
+            ), mock.patch(
+                "agent_os.application.services.local_platform_operations."
+                "run_hermes_tui_gateway_activation",
+                return_value=gateway_result,
+            ) as run_gateway:
+                result = service.activate_hermes_registered_session(
+                    "workspace-hermes",
+                    agent_id="agent-b",
+                    handle_id="hermes-handle-gateway",
+                    exchange_request_id="req-hermes-1",
+                    database_path=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "workspace"),
+                    plugins_directory=str(root / "plugins"),
+                    handoff_directory=str(root / "handoff"),
+                    activation_backend="tui_gateway",
+                    gateway_python="gateway-python",
+                    dry_run=False,
+                )
+
+            activation = result["hermesRegisteredSessionActivation"]
+            request = service.get_agent_exchange_request_status(
+                "workspace-hermes",
+                exchange_request_id="req-hermes-1",
+            )["agentExchangeRequest"]
+            self.assertEqual(
+                result["providerBackendSelection"]["effectiveBackend"],
+                "hermes_tui_gateway_stdio",
+            )
+            self.assertEqual(activation["status"], "delivered")
+            self.assertEqual(activation["activationBackend"], "tui_gateway")
+            self.assertEqual(activation["replyWritebackMode"], "explicit_only")
+            self.assertEqual(activation["runtimeSessionId"], "runtime-abcd")
+            self.assertEqual(
+                activation["activationBoundary"]["route"],
+                "hermes_tui_gateway_stdio",
+            )
+            self.assertEqual(
+                activation["activationBoundary"]["gatewayLifecycle"],
+                "short_lived_operation_owned_stdio",
+            )
+            self.assertEqual(activation["responseCaptureStatus"], "explicit_only")
+            self.assertFalse(activation["targetResponseCompleted"])
+            self.assertEqual(request["status"], "active")
+            self.assertEqual(
+                activation["providerRuntimeMetadata"]["run"]["runtimeSessionId"],
+                "runtime-abcd",
+            )
+            run_config = run_gateway.call_args.args[0]
+            self.assertEqual(run_config.persistent_session_id, session_id)
+            self.assertEqual(run_config.registered_source, "cli")
+            self.assertEqual(run_config.cwd, str(root.resolve()))
+
     def test_dry_run_renders_ticket_and_command_without_provider_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

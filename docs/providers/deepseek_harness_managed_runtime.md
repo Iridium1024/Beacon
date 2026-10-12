@@ -1,5 +1,9 @@
 # DeepSeek Harness Managed Runtime
 
+For ordinary messages use [daily CLI](../agent/agent_entry.md) or
+[daily MCP](../agent/agent_mcp.md). This page is optional setup/troubleshooting
+reference; read only the section for your provider task.
+
 Status: opt-in fourth Agent platform with exact persisted-session join and
 cross-runtime resume; authenticated real-model smoke remains pending.
 

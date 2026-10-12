@@ -1,12 +1,19 @@
-<!-- beacon-version: 0.1.1 -->
+<!-- beacon-version: 0.2.0 -->
 # Changelog
 
 All notable public-facing changes will be recorded here. Internal automation
 steps and private migration history are intentionally excluded.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-11
 
 ### Added
+
+- Durable communication core with independent execution ownership, explicit
+  ACK/final receipts, bounded waits, and operator-controlled migration.
+- Optional local stdio MCP adapter with 13 tools, workspace-scoped short
+  references, opt-in compact messages, and an explicit Agent authority boundary.
+- Task-oriented Agent documentation with separate setup and troubleshooting
+  guides.
 
 - Deterministic project scope through `.beacon/workspace.json`, plus preflighted
   idempotent `agent-join` and concise `agent-reply` commands.
@@ -23,26 +30,25 @@ steps and private migration history are intentionally excluded.
   generation per created or exactly resumed persistent DSH session,
   authenticated loopback supervisor IPC, owned-live status, strict causal
   final capture, and explicit stop/resume/recreate.
-- Credential-free source-installation and release-draft documentation for the
-  DSH increment. The delivery is source-only, not a GitHub Release or an
-  installer; authenticated DSH model communication remains unverified.
-- P3-A local read-only heterogeneous session-console spike composed through the
+- Source-installation documentation for optional runtimes; authenticated DSH
+  model communication remains unverified.
+- DSH adapter local read-only heterogeneous session-console spike composed through the
   official DeepSeek Harness Web profile and Host/Client plugin points. A
   versioned GET-only Beacon projection shows synthetic/local workspace,
   Agent/session, dispatch, capability, and bounded timeline state for Claude,
   Codex, Hermes, and DSH without provider control or transcript reads.
-- P3-B standalone React + Tauri v2 read-only Desktop validation with offline
-  fake data and an explicit loopback External Gateway mode. It reuses the P3-A
+- Standalone React + Tauri v2 read-only Desktop validation with offline
+  fake data and an explicit loopback External Gateway mode. It reuses the DSH adapter
   host-neutral UI/protocol, validates a GET-only console API 1.0 health/version
   handshake before projection reads, starts without DSH/Node/Gateway/Python, and produces
   a Windows development executable without bundling an installer or sidecar.
-- P3-B-2 browser-first product validation on the same React/store/protocol
+- Browser UI on the same React/store/protocol
   tree, with a unified keyboard-accessible Settings surface, Chinese/English
   locale, appearance/contrast/text-scale preferences, layered terminology and
   capability explanations, deterministic Fake/failure scenarios, and exact
   Playwright viewport/screenshot gates. The host remains loopback-only and
-  read-only; Tauri and the optional P3-A DSH adapter are retained.
-- P3-B-3 local-entry and dependency hardening: `start-beacon-browser.cmd`
+  read-only; Tauri and the optional DSH adapter are retained.
+- Local-entry and dependency hardening: `start-beacon-browser.cmd`
   launches the existing foreground loopback browser host after bounded local
   checks, while Gateway pins Fastify 5.12.1 and repaired `fast-uri` /
   `find-my-way` resolutions without a major upgrade or API change.
@@ -119,8 +125,7 @@ steps and private migration history are intentionally excluded.
 
 ## [0.1.1] - 2026-07-15
 
-The historical public notes for this local development version are not part of
-the DSH-only source increment.
+See [release notes](docs/release/v0.1.1.md) for this version.
 
 ### Added
 

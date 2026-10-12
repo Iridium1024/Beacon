@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+from agent_os.application.services.communication_policy import (
+    dispatch_backend_capture,
+    _contact_policy_profile, _contact_policy_source_facts, _contact_policy_has_rules,
+    _matched_contact_policy_rules, _dispatch_contact_policy_decision,
+    _dispatch_reply_reachability, _required_list_text, _text_tuple,
+)
+
 import json
 import subprocess
+from hashlib import sha256
 from collections.abc import Mapping as MappingABC
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -15,6 +23,7 @@ from agent_os.application.services.agent_endpoint import (
     normalize_agent_endpoint_provider,
 )
 from agent_os.application.services.agent_communication_context import (
+    build_agent_cli_actions,
     build_beacon_cli_invocation,
     cli_shell_examples,
 )
@@ -60,8 +69,10 @@ from agent_os.application.services.deepseek_harness_registered_session import (
 from agent_os.application.services.console_projection import (
     ConsoleProjectionService,
     DEFAULT_TIMELINE_LIMIT,
+    MAX_TIMELINE_LIMIT,
 )
 from agent_os.domain.entities.context import ContextUpdateKind
+from agent_os.domain.entities.communication import AccessDenied, Caller, delivery_identity
 from agent_os.infrastructure.composition.local_platform import (
     LocalPlatformRuntimeComponents,
     build_local_platform_runtime,
@@ -82,6 +93,44 @@ class LocalPlatformApplication:
                 "database": components.settings.database,
                 "schemaInitialized": components.settings.initialize_schema,
             }
+
+    def communication_mode(self, workspace_id: str) -> str:
+        with self._components() as components:
+            return components.communication_mode(workspace_id)
+
+    def communication_migration_preview(self, workspace_id: str) -> Mapping[str, object]:
+        from agent_os.application.services.communication_migration import CommunicationMigration
+        from agent_os.infrastructure.adapters.communication_directory import PlatformCommunicationDirectory
+        with self._components() as components:
+            migration = CommunicationMigration(components.connection,
+                directory=PlatformCommunicationDirectory(components.connection,
+                    platform=components.operations()))
+            return migration.preview(workspace_id)
+
+    def communication_migrate(self, *, workspace_id: str, operator: str,
+                              backup_path: str, stopped_writers_confirmed: bool) -> Mapping[str, object]:
+        from agent_os.application.services.communication_migration import CommunicationMigration
+        from agent_os.infrastructure.adapters.communication_directory import PlatformCommunicationDirectory
+        if stopped_writers_confirmed is not True:
+            raise ValueError("migration requires explicit stopped-writer confirmation")
+        with self._components() as components:
+            migration = CommunicationMigration(components.connection,
+                directory=PlatformCommunicationDirectory(components.connection,
+                    platform=components.operations()))
+            preview = migration.preview(workspace_id)
+            if preview["blockers"]:
+                raise ValueError("migration preview has unresolved blockers")
+            backup = migration.backup(backup_path)
+            result = migration.migrate(workspace_id, operator=operator,
+                stopped_writers_confirmed=True)
+            return {"migration": result, "backup": backup,
+                    "postMigrationPreview": migration.preview(workspace_id)}
+
+    @staticmethod
+    def _require_legacy_communication_route(components: LocalPlatformRuntimeComponents,
+                                             workspace_id: str) -> None:
+        if components.communication_mode(workspace_id) == "core":
+            raise ValueError("communication core workspace route is not yet wired for this operation")
 
     def agent_runtime_preflight(
         self,
@@ -145,13 +194,14 @@ class LocalPlatformApplication:
         *,
         workspace_id: str,
         cursor: str | None = None,
+        communication_cursor: str | None = None,
         limit: int = DEFAULT_TIMELINE_LIMIT,
     ) -> Mapping[str, object]:
         """Return a bounded heterogeneous-session view with no mutation surface."""
 
         with self._components() as components:
             operations = components.operations()
-            return ConsoleProjectionService(
+            view = ConsoleProjectionService(
                 operations=operations,
                 event_log=operations.event_log_reader,
             ).workspace_view(
@@ -159,6 +209,46 @@ class LocalPlatformApplication:
                 cursor=cursor,
                 limit=limit,
             )
+            service = components.communication(workspace_id)
+            if service is None:
+                return view
+            if communication_cursor is None:
+                ledger_after = 0
+            elif (communication_cursor.startswith("ledger:")
+                  and communication_cursor[7:].isdecimal()):
+                ledger_after = int(communication_cursor[7:])
+            else:
+                raise ValueError("communication cursor must use ledger:<sequence>")
+            communication_page = service.repo.console_events(
+                workspace_id, after=ledger_after, limit=limit)
+            state_map = {"pending": "queued", "leased": "leased", "done": "completed",
+                         "cancelled": "cancelled", "failed": "failed", "unknown": "unknown",
+                         "expired": "expired"}
+            dispatches = []
+            for message in service.repo.workspace_items("messages", workspace_id):
+                delivery = service.repo.get("deliveries", workspace_id,
+                    delivery_identity(message["id"], message["target"]))
+                if delivery is None or not (message.get("legacy_dispatch_id")
+                                             or delivery.get("legacy_dispatch_id")):
+                    continue
+                binding = delivery.get("binding") or {}
+                dispatches.append({"schema": "dispatch_projection.v1",
+                    "workspaceId": workspace_id,
+                    "dispatchId": message.get("legacy_dispatch_id") or delivery["legacy_dispatch_id"],
+                    "exchangeRequestId": message.get("legacy_request_id") or message["id"],
+                    "sourceAgentId": message["sender"], "targetAgentId": message["target"],
+                    "targetProvider": binding.get("provider"),
+                    "targetHandleId": binding.get("handle_id"),
+                    "status": state_map.get(delivery["schedule"], "unknown"),
+                    "apiLayer": "delivery-oriented", "updatedAt": message["created_at"]})
+            dispatches.sort(key=lambda item: (item["updatedAt"], item["dispatchId"]), reverse=True)
+            return {**view, "dispatches": dispatches[:MAX_TIMELINE_LIMIT],
+                    "communicationLedger": {"schema": "console_communication_page.v1",
+                        "cursor": communication_cursor,
+                        "events": communication_page["events"],
+                        "nextCursor": communication_page["nextCursor"],
+                        "hasMore": communication_page["hasMore"],
+                        "upper": communication_page["upper"]}}
 
     def open_workspace(self, workspace_id: str) -> Mapping[str, object]:
         with self._components() as components:
@@ -487,6 +577,48 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                request_id = exchange_request_id or f"agent-exchange-request-{uuid4()}"
+                source_alias, target_alias = self._core_dispatch_endpoint_aliases(
+                    workspace_id=workspace_id, source_agent_id=source_agent_id,
+                    target_agent_id=target_agent_id, source_alias=None, target_alias=None,
+                    source_handle_id=None, target_handle_id=None, target_provider=None,
+                    reply_policy="message_only")
+                resolution = self._resolve_dispatch_endpoint_aliases(
+                    workspace_id=workspace_id, source_agent_id=source_agent_id,
+                    target_agent_id=target_agent_id, from_endpoint_alias=source_alias,
+                    to_endpoint_alias=target_alias, source_handle_id=None,
+                    target_handle_id=None, target_provider=None,
+                    reply_policy="message_only")
+                parent_message_id = (self._core_message_id(service, workspace_id, parent_request_id)
+                                     if parent_request_id else None)
+                message = service.send(Caller(workspace_id, source_agent_id),
+                    target_alias=target_alias, body=request_summary,
+                    key=request_id, refs=detail_refs, thread_id=thread_id,
+                    reply_to=parent_message_id, expectation="final", expires_at=_optional_datetime(expires_at),
+                    wake="none", capture="explicit_only", source_alias=source_alias,
+                    reply_policy="message_only", source_handle_id=resolution.source_handle_id,
+                    target_handle_id=resolution.target_handle_id,
+                    linked_delegated_wake_grant_id=linked_delegated_wake_grant_id,
+                    legacy_context={"request_id": request_id, "request_kind": request_kind,
+                        "parent_request_id": parent_request_id, "root_request_id": root_request_id,
+                        "thread_id": thread_id, "turn_index": turn_index,
+                        "linked_task_id": linked_task_id,
+                        "linked_conversation_id": linked_conversation_id,
+                        "linked_activation_id": linked_activation_id,
+                        "linked_delegated_wake_grant_id": linked_delegated_wake_grant_id,
+                        "requires_user_review": requires_user_review,
+                        "metadata": {**dict(metadata or {}), "agentSessionId": agent_session_id,
+                            "connectionInstanceId": connection_instance_id}})
+                status = self._core_request_status(service, workspace_id,
+                    message["id"], source_agent_id)
+                return {"engine": "core", "created": True,
+                    "agentExchangeRequest": status["agentExchangeRequest"],
+                    "agentExchangeThread": self._core_thread_metadata(service, workspace_id,
+                        message["thread_id"], source_agent_id),
+                    "sourceEventSequence": None,
+                    "communicationLedgerSequence": status["communicationLedgerSequence"]}
             return components.operations().create_agent_exchange_request(
                 workspace_id,
                 source_agent_id=source_agent_id,
@@ -517,8 +649,28 @@ class LocalPlatformApplication:
         source_agent_id: str | None = None,
         target_agent_id: str | None = None,
         status: str | None = None,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core request list requires an explicit requesting agent id")
+                service.directory.require_member(Caller(workspace_id, requesting_agent_id))
+                records = []
+                for message in service.repo.workspace_items("messages", workspace_id):
+                    if source_agent_id is not None and message["sender"] != source_agent_id:
+                        continue
+                    if target_agent_id is not None and message["target"] != target_agent_id:
+                        continue
+                    try:
+                        request = self._core_request_status(service, workspace_id,
+                            message["id"], requesting_agent_id)["agentExchangeRequest"]
+                    except AccessDenied:
+                        continue
+                    if status is None or request["status"] == status:
+                        records.append(request)
+                return {"engine": "core", "agentExchangeRequests": records}
             return components.operations().list_agent_exchange_requests(
                 workspace_id,
                 source_agent_id=source_agent_id,
@@ -531,8 +683,15 @@ class LocalPlatformApplication:
         *,
         workspace_id: str,
         exchange_request_id: str,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core status requires an explicit requesting agent id")
+                return self._core_request_status(service, workspace_id,
+                    exchange_request_id, requesting_agent_id)
             return components.operations().get_agent_exchange_request_status(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -547,8 +706,23 @@ class LocalPlatformApplication:
         thread_id: str | None = None,
         read_live_runtime_status: bool | str = "auto",
         waiting_response_stale_threshold_seconds: int = 600,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core status requires an explicit requesting agent id")
+                reference = exchange_request_id
+                if reference is None and dispatch_id is not None:
+                    matches = service.repo.mappings_for_legacy(workspace_id, "dispatch", dispatch_id)
+                    if len(matches) != 1:
+                        raise ValueError("dispatch has no unique core message mapping")
+                    reference = matches[0]["new_id"]
+                if reference is None:
+                    raise ValueError("core status requires a request or dispatch id")
+                return self._core_request_status(service, workspace_id,
+                    reference, requesting_agent_id, dispatch_id=dispatch_id)
             return components.operations().get_agent_exchange_status_summary(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -569,8 +743,42 @@ class LocalPlatformApplication:
         response_summary: str,
         requires_user_review: bool | None = None,
         metadata: Mapping[str, object] | None = None,
+        idempotency_key: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                from agent_os.domain.entities.communication import Caller
+                supplied = dict(metadata or {})
+                source = supplied.get("responseSource")
+                actual_writer = supplied.get("actualWriterAgentId")
+                if source not in (None, "explicit"):
+                    raise ValueError("agent CLI cannot assert provider response authority")
+                if actual_writer is not None and actual_writer != responding_agent_id:
+                    raise ValueError("actual writer must match responding agent")
+                identity = self._core_message_id(service, workspace_id, exchange_request_id)
+                message = service.get(Caller(workspace_id, responding_agent_id), identity)
+                quality = (bool(message.get("legacy_requires_user_review"))
+                           if requires_user_review is None else requires_user_review)
+                receipt = service.reply(Caller(workspace_id, responding_agent_id), identity,
+                    body=response_summary, key=idempotency_key or str(uuid4()),
+                    kind="final", strict_active=True, requires_user_review=quality,
+                    client_metadata=supplied)
+                sequence = service.repo.sequence("receipts", workspace_id, receipt["id"])
+                return {"engine": "core", "responded": True,
+                    "agentExchangeRequest": {"schema": "agent_exchange_request.v1",
+                        "exchangeRequestId": exchange_request_id, "messageId": identity,
+                        "workspaceId": workspace_id, "sourceAgentId": message["sender"],
+                        "targetAgentId": message["target"], "threadId": message["thread_id"],
+                        "requestSummary": message["body"], "responseSummary": receipt["body"],
+                        "respondedByAgentId": responding_agent_id,
+                        "respondedAt": receipt["created_at"], "status": "terminal",
+                        "terminalReason": "responded", "requiresUserReview": quality,
+                        "sourceEventSequence": None,
+                        "communicationLedgerSequence": sequence},
+                    "sourceEventSequence": None, "communicationLedgerSequence": sequence}
+            if idempotency_key is not None:
+                raise ValueError("idempotency key requires an explicitly migrated workspace")
             return components.operations().respond_agent_exchange_request(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -588,8 +796,30 @@ class LocalPlatformApplication:
         terminal_reason: str = "closed",
         requires_user_review: bool | None = None,
         metadata: Mapping[str, object] | None = None,
+        closing_agent_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                from agent_os.domain.entities.communication import Caller
+                if closing_agent_id is None:
+                    raise ValueError("core close requires an explicit closing agent id")
+                if metadata:
+                    raise ValueError("core close metadata is not yet supported")
+                identity = self._core_message_id(service, workspace_id, exchange_request_id)
+                closed = service.close(Caller(workspace_id, closing_agent_id), identity,
+                    key=idempotency_key or str(uuid4()), strict_active=True,
+                    reason=terminal_reason, requires_user_review=requires_user_review)
+                sequence = service.repo.sequence("deliveries", workspace_id,
+                    service._delivery(service.repo.get("messages", workspace_id, identity))["id"])
+                return {"engine": "core", "closed": True,
+                    "agentExchangeRequest": self._core_request_status(service, workspace_id,
+                        exchange_request_id, closing_agent_id)["agentExchangeRequest"],
+                    "closeResult": closed, "sourceEventSequence": None,
+                    "communicationLedgerSequence": sequence}
+            if idempotency_key is not None:
+                raise ValueError("idempotency key requires an explicitly migrated workspace")
             return components.operations().close_agent_exchange_request(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -597,6 +827,224 @@ class LocalPlatformApplication:
                 requires_user_review=requires_user_review,
                 metadata=metadata,
             )
+
+    @staticmethod
+    def _core_message_id(service, workspace_id: str, reference: str) -> str:
+        if service.repo.get("messages", workspace_id, reference) is not None:
+            return reference
+        matches = service.repo.mappings_for_legacy(workspace_id, "request", reference)
+        if len(matches) != 1:
+            raise ValueError("message or uniquely mapped legacy request was not found")
+        return matches[0]["new_id"]
+
+    @classmethod
+    def _core_request_status(cls, service, workspace_id: str, reference: str,
+                             requesting_agent_id: str, *, dispatch_id: str | None = None) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        identity = cls._core_message_id(service, workspace_id, reference)
+        facts = service.status(Caller(workspace_id, requesting_agent_id), identity)
+        message, delivery = facts["message"], facts["delivery"]
+        final = next((item for item in facts["receipts"]
+                      if item["kind"] == "final" and not item["late"]), None)
+        terminal_reason = (message.get("legacy_terminal_reason") or
+                           ("responded" if final else delivery.get("closed_reason", "closed")
+                            if delivery["closed_at"] else None))
+        request = {"schema": "agent_exchange_request.v1", "workspaceId": workspace_id,
+            "exchangeRequestId": message.get("legacy_request_id") or identity,
+            "messageId": identity, "sourceAgentId": message["sender"],
+            "targetAgentId": message["target"], "threadId": message["thread_id"],
+            "requestKind": message.get("legacy_request_kind") or "sync",
+            "requestSummary": message["body"], "detailRefs": message["refs"],
+            "status": "terminal" if terminal_reason else "active",
+            "terminalReason": terminal_reason,
+            "responseSummary": final["body"] if final else None,
+            "respondedByAgentId": final["author"] if final else None,
+            "respondedAt": final["created_at"] if final else None,
+            "requiresUserReview": (bool(final["requires_user_review"]) if final else
+                                   bool(delivery.get("requires_user_review",
+                                        message.get("legacy_requires_user_review")))),
+            "sourceEventSequence": None,
+            "communicationLedgerSequence": service.repo.sequence("messages", workspace_id, identity)}
+        dispatch = {"schema": "agent_dispatch.v1", "workspaceId": workspace_id,
+            "dispatchId": dispatch_id or message.get("legacy_dispatch_id")
+                or delivery.get("legacy_dispatch_id"),
+            "exchangeRequestId": request["exchangeRequestId"],
+            "messageId": identity, "status": delivery["schedule"],
+            "providerActivationExecuted": delivery["execution"] not in {"not_started", "unknown"},
+            "sourceEventSequence": None,
+            "communicationLedgerSequence": service.repo.sequence("deliveries", workspace_id, delivery["id"])}
+        source = final["source"] if final else None
+        return {"engine": "core", "agentExchangeRequest": request,
+            "agentDispatch": dispatch, "messageStatus": facts,
+            "responseSourceStatus": {"responded": final is not None,
+                "standardResponded": bool(final and source in {"explicit", "legacy_import"}),
+                "responseSource": source},
+            "sourceEventSequence": None,
+            "communicationLedgerSequence": service.repo.high_water()}
+
+    @staticmethod
+    def _require_communication(components: LocalPlatformRuntimeComponents, workspace_id: str):
+        service = components.communication(workspace_id)
+        if service is None:
+            raise ValueError("workspace has not explicitly switched to the communication core")
+        return service
+
+    def communication_runtime_init(self, *, workspace_id):
+        from agent_os.infrastructure.composition.communication_runtime import initialize_runtime
+        return initialize_runtime(self.settings, workspace_id)
+
+    def run_communication_consumer(self, *, workspace_id, config, provider_options,
+                                   preflight=True, runtime_policy="auto", target_agent_id=None):
+        from agent_os.infrastructure.composition.communication_runtime import run_supervisor
+        return run_supervisor(self.settings, workspace_id, config=config, options=provider_options,
+                              preflight=preflight, runtime_policy=runtime_policy,
+                              target_agent_id=target_agent_id)
+
+    def communication_runtime_status(self, *, workspace_id):
+        from agent_os.infrastructure.composition.communication_runtime import runtime_status
+        return runtime_status(self.settings, workspace_id)
+
+    def communication_runtime_stop(self, *, workspace_id):
+        from agent_os.infrastructure.composition.communication_runtime import stop_runtime
+        return stop_runtime(self.settings, workspace_id)
+
+    def communication_runtime_reconcile(self, *, workspace_id, attempt_id):
+        from agent_os.infrastructure.composition.communication_runtime import reconcile_runtime
+        return reconcile_runtime(self.settings, workspace_id, attempt_id)
+
+    def communication_short_refs_init(self, *, workspace_id, operator, backup_path,
+                                      stopped_writers_confirmed=False):
+        from agent_os.application.services.communication_short_refs import ShortReferences
+        from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+        if not isinstance(backup_path, str) or not backup_path.strip():
+            raise ValueError("short-reference administration requires an explicit new backup path")
+        if stopped_writers_confirmed is not True:
+            raise ValueError("short-reference administration requires stopped-writer confirmation")
+        with prepared_runtime(self.settings, workspace_id) as (_, service):
+            state = service.coordination.consumer_status(workspace_id, service._now())["state"]
+            if state in {"running", "draining"}:
+                raise ValueError("stop the active consumer and all writers before short-reference initialization")
+            return ShortReferences(service).initialize(workspace_id, operator=operator,
+                stopped_writers_confirmed=stopped_writers_confirmed, backup_path=backup_path)
+
+    def agent_short_ref(self, *, workspace_id, agent_id, kind, reference):
+        from agent_os.application.services.communication_short_refs import ShortReferences
+        from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+        with prepared_runtime(self.settings, workspace_id) as (_, service):
+            identity = ShortReferences(service).resolve(Caller(workspace_id, agent_id), kind, reference)
+            return {"kind": kind, "reference": reference, "id": identity}
+
+    def agent_session_ref(self, *, workspace_id, agent_id, session_ref, include_native=False):
+        from agent_os.application.services.communication_short_refs import ShortReferences
+        from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+        with prepared_runtime(self.settings, workspace_id) as (_, service):
+            return ShortReferences(service).lookup_session(Caller(workspace_id, agent_id), session_ref,
+                                                          include_native=include_native)
+
+    @staticmethod
+    def agent_compact_explain(*, version="B1"):
+        from agent_os.application.services.communication_envelope import explain_compact
+        return explain_compact(version)
+
+    @classmethod
+    def _communication_message_identity(cls, service, caller, *, message_id=None, message_ref=None):
+        if (message_id is None) == (message_ref is None):
+            raise ValueError("choose exactly one explicit message-id or message-ref")
+        if message_ref is not None:
+            from agent_os.application.services.communication_short_refs import ShortReferences
+            return ShortReferences(service).resolve(caller, "message", message_ref)
+        return cls._core_message_id(service, caller.workspace_id, message_id)
+
+    def agent_message_compact(self, *, workspace_id, agent_id, message_id=None, message_ref=None,
+                              include_bodies=False):
+        from agent_os.application.services.communication_envelope import CommunicationEnvelope
+        from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+        with prepared_runtime(self.settings, workspace_id) as (_, service):
+            caller = Caller(workspace_id, agent_id)
+            identity = self._communication_message_identity(service, caller,
+                message_id=message_id, message_ref=message_ref)
+            return CommunicationEnvelope(service).summary(caller, identity, include_body=include_bodies)
+
+    def agent_message_wait(self, *, workspace_id, agent_id, message_id=None, message_ref=None,
+                           condition="ack", timeout=120, key=None, include_bodies=False):
+        from agent_os.application.services.communication_wait import CommunicationWait
+        from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+        with prepared_runtime(self.settings, workspace_id) as (_, service):
+            caller = Caller(workspace_id, agent_id)
+            identity = self._communication_message_identity(service, caller,
+                message_id=message_id, message_ref=message_ref)
+            return CommunicationWait(service, service.coordination).wait(caller, identity,
+                condition=condition, timeout=timeout, key=key, include_bodies=include_bodies)
+
+    def agent_message_wait_status(self, *, workspace_id, agent_id, observation_id=None,
+                                   message_id=None, message_ref=None, cancel=False):
+        from agent_os.infrastructure.composition.communication_runtime import observation_operation
+        if message_ref is not None:
+            if observation_id is not None or message_id is not None or cancel:
+                raise ValueError("message-ref wait discovery cannot name an observation or cancel it")
+            from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+            with prepared_runtime(self.settings, workspace_id) as (_, service):
+                message_id = self._communication_message_identity(service, Caller(workspace_id, agent_id),
+                                                                 message_ref=message_ref)
+        return observation_operation(self.settings, workspace_id, agent_id, observation_id, message_id=message_id, cancel=cancel)
+
+    def agent_message_get(self, *, workspace_id: str, agent_id: str,
+                          message_id: str | None = None, message_ref: str | None = None) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            identity = self._communication_message_identity(service, Caller(workspace_id, agent_id),
+                                                            message_id=message_id, message_ref=message_ref)
+            return {"engine": "core", "message": service.get(Caller(workspace_id, agent_id), identity)}
+
+    def agent_message_status(self, *, workspace_id: str, agent_id: str,
+                             message_id: str | None = None, message_ref: str | None = None) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            identity = self._communication_message_identity(service, Caller(workspace_id, agent_id),
+                                                            message_id=message_id, message_ref=message_ref)
+            return {"engine": "core", **service.status(Caller(workspace_id, agent_id), identity)}
+
+    def agent_message_inbox(self, *, workspace_id: str, agent_id: str,
+                            cursor: str | None = None, limit: int = 20,
+                            include_bodies: bool = False, compact: bool = False) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            caller = Caller(workspace_id, agent_id)
+            result = {"engine": "core", **service.inbox(caller,
+                cursor=cursor, limit=limit, include_bodies=include_bodies)}
+            if type(compact) is not bool:
+                raise ValueError("compact inbox option must be a boolean")
+            if compact:
+                from agent_os.application.services.communication_envelope import CommunicationEnvelope
+                for item in result["items"]:
+                    item["compact"] = CommunicationEnvelope(service).summary(caller, item["message_id"])
+            return result
+
+    def agent_message_ack(self, *, workspace_id: str, agent_id: str,
+                          message_id: str | None = None, message_ref: str | None = None,
+                          idempotency_key: str | None = None) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            identity = self._communication_message_identity(service, Caller(workspace_id, agent_id),
+                                                            message_id=message_id, message_ref=message_ref)
+            return {"engine": "core", "receipt": service.ack(
+                Caller(workspace_id, agent_id), identity, key=idempotency_key or str(uuid4()))}
+
+    def agent_message_reply(self, *, workspace_id: str, agent_id: str,
+                            body: str, message_id: str | None = None, message_ref: str | None = None, kind: str = "final",
+                            idempotency_key: str | None = None) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            identity = self._communication_message_identity(service, Caller(workspace_id, agent_id),
+                                                            message_id=message_id, message_ref=message_ref)
+            return {"engine": "core", "receipt": service.reply(
+                Caller(workspace_id, agent_id), identity, body=body,
+                kind=kind, key=idempotency_key or str(uuid4()))}
 
     def create_agent_dispatch(
         self,
@@ -626,7 +1074,23 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
         dry_run: bool = False,
     ) -> Mapping[str, object]:
+        if self.communication_mode(workspace_id) == "core":
+            return self.send_agent_dispatch(workspace_id=workspace_id,
+                source_agent_id=source_agent_id, target_agent_id=target_agent_id,
+                request_kind=request_kind, request_summary=request_summary,
+                dispatch_id=dispatch_id, exchange_request_id=exchange_request_id,
+                source_handle_id=source_handle_id, target_handle_id=target_handle_id,
+                target_provider=target_provider, reply_policy=reply_policy,
+                detail_refs=detail_refs, linked_task_id=linked_task_id,
+                linked_conversation_id=linked_conversation_id,
+                linked_activation_id=linked_activation_id,
+                linked_delegated_wake_grant_id=linked_delegated_wake_grant_id,
+                parent_request_id=parent_request_id, root_request_id=root_request_id,
+                thread_id=thread_id, turn_index=turn_index, expires_at=expires_at,
+                requires_user_review=requires_user_review, metadata=metadata,
+                delivery_mode="queued", dry_run=dry_run)
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().create_agent_dispatch(
                 workspace_id,
                 source_agent_id=source_agent_id,
@@ -654,6 +1118,188 @@ class LocalPlatformApplication:
                 dry_run=dry_run,
             )
 
+    def _core_dispatch_endpoint_aliases(
+        self, *, workspace_id: str, source_agent_id: str | None,
+        target_agent_id: str | None, source_alias: str | None,
+        target_alias: str | None, source_handle_id: str | None,
+        target_handle_id: str | None, target_provider: str | None,
+        reply_policy: str | None,
+    ) -> tuple[str | None, str]:
+        """Resolve ID-only legacy input to exactly one live route before send."""
+        if target_alias is None and target_agent_id is None:
+            raise ValueError("targetAgentId or target endpoint alias is required")
+        if source_alias is None and source_agent_id is None:
+            raise ValueError("sourceAgentId or source endpoint alias is required")
+        if target_alias is None:
+            candidates = self.list_agent_endpoints(
+                workspace_id=workspace_id, agent_id=target_agent_id,
+                include_inactive=False)["agentEndpoints"]
+            candidates = [e for e in candidates
+                          if e["direction"] in {"receive_only", "send_receive"}
+                          and (target_handle_id is None or e["providerHandleId"] == target_handle_id)
+                          and (target_provider is None or e["provider"] == normalize_agent_endpoint_provider(target_provider))]
+            if len(candidates) != 1:
+                raise ValueError("core dispatch target requires one unique active endpoint alias")
+            target_alias = str(candidates[0]["alias"])
+        if source_alias is None and (source_handle_id is not None or reply_policy != "message_only"):
+            candidates = self.list_agent_endpoints(
+                workspace_id=workspace_id, agent_id=source_agent_id,
+                include_inactive=False)["agentEndpoints"]
+            candidates = [e for e in candidates
+                          if e["direction"] in {"send_only", "send_receive"}
+                          and (source_handle_id is None or e["providerHandleId"] == source_handle_id)]
+            if len(candidates) == 1:
+                source_alias = str(candidates[0]["alias"])
+            elif source_handle_id is not None or len(candidates) > 1:
+                raise ValueError("core dispatch source requires one unique active endpoint alias")
+        return source_alias, target_alias
+
+    def _send_agent_dispatch_core(
+        self, *, workspace_id: str, endpoint_resolution: "_DispatchEndpointAliasResolution",
+        source_alias: str | None, target_alias: str, route_summary: Mapping[str, object],
+        acting_identity: Mapping[str, object], request_kind: str, request_summary: str,
+        dispatch_id: str | None, exchange_request_id: str | None,
+        idempotency_key: str | None,
+        detail_refs: tuple[str, ...], linked_task_id: str | None,
+        linked_conversation_id: str | None, linked_activation_id: str | None,
+        linked_delegated_wake_grant_id: str | None, parent_request_id: str | None,
+        root_request_id: str | None, thread_id: str | None, turn_index: int | None,
+        expires_at: datetime | None, requires_user_review: bool,
+        metadata: Mapping[str, object], delivery_mode: str, dry_run: bool,
+        claude_activation_backend: str, claude_reply_writeback_mode: str | None,
+        codex_activation_backend: str, codex_reply_writeback_mode: str,
+        hermes_activation_backend: str, hermes_reply_writeback_mode: str | None,
+        immediate_busy_policy: str, worker_options: Mapping[str, object],
+        wait_condition: str | None = None, wait_timeout_seconds: float = 120,
+        target_session_ref: str | None = None,
+    ) -> Mapping[str, object]:
+        from agent_os.domain.entities.communication import Caller
+
+        if idempotency_key is not None:
+            if not idempotency_key.strip() or len(idempotency_key) > 256:
+                raise ValueError("idempotency key must be non-empty and at most 256 characters")
+            stable = sha256((workspace_id + "\0" + endpoint_resolution.source_agent_id
+                             + "\0" + idempotency_key).encode("utf-8")).hexdigest()[:32]
+        else:
+            stable = None
+        request_id = exchange_request_id or (f"agent-exchange-request-idem-{stable}"
+                                              if stable else f"agent-exchange-request-{uuid4()}")
+        resolved_dispatch_id = dispatch_id or (f"agent-dispatch-idem-{stable}"
+                                               if stable else f"agent-dispatch-{uuid4()}")
+        provider = endpoint_resolution.target_provider
+        if provider == "claude":
+            backend, capture = dispatch_backend_capture(provider, claude_activation_backend, claude_reply_writeback_mode)
+        elif provider == "codex":
+            backend, capture = dispatch_backend_capture(provider, codex_activation_backend, codex_reply_writeback_mode)
+        elif provider == "hermes":
+            backend, capture = dispatch_backend_capture(provider, hermes_activation_backend, hermes_reply_writeback_mode)
+        elif provider == "deepseek_harness":
+            backend, capture = dispatch_backend_capture(provider, "sdk_stdio")
+        else:
+            raise ValueError("core dispatch target provider is unsupported")
+        if dry_run or delivery_mode == "worker_dry_run":
+            return {"schema": "agent_dispatch_send.core.v1", "engine": "core",
+                    "workspaceId": workspace_id, "dryRun": True,
+                    "queuedDispatchCreated": False, "workerRunRequested": False,
+                    "routeSummary": route_summary, "actingIdentity": acting_identity,
+                    "providerBackend": backend, "capturePolicy": capture,
+                    "plannedAgentExchangeRequest": {"exchangeRequestId": request_id,
+                        "sourceAgentId": endpoint_resolution.source_agent_id,
+                        "targetAgentId": endpoint_resolution.target_agent_id,
+                        "requestKind": request_kind, "requestSummary": request_summary},
+                    "agentDispatch": {"dispatchId": resolved_dispatch_id, "status": "dry_run"}}
+        actions = build_agent_cli_actions(
+            database_path=self.settings.database, workspace_root=self.settings.workspace_root,
+            plugins_directory=self.settings.plugins_directory,
+            profile_path=self.settings.profile_path, workspace_id=workspace_id,
+            exchange_request_id=request_id,
+            target_agent_id=endpoint_resolution.target_agent_id, core_mode=True)
+        with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is None:
+                raise ValueError("workspace is not in communication core mode")
+            parent_message_id = None
+            if parent_request_id is not None:
+                matches = service.repo.mappings_for_legacy(workspace_id, "request", parent_request_id)
+                if len(matches) != 1:
+                    raise ValueError("parent request has no unique core mapping")
+                parent_message_id = matches[0]["new_id"]
+            message = service.send(
+                Caller(workspace_id, endpoint_resolution.source_agent_id),
+                target_alias=target_alias, body=request_summary, refs=detail_refs,
+                key=idempotency_key or resolved_dispatch_id, thread_id=thread_id,
+                reply_to=parent_message_id,
+                expectation="final" if endpoint_resolution.reply_policy != "message_only" else "none",
+                expires_at=expires_at, wake="when_available", capture=capture,
+                delivery_path="inline" if delivery_mode == "worker_execute" else "queued",
+                require_consumer=wait_condition is not None,
+                target_session_ref=target_session_ref,
+                source_alias=source_alias, reply_policy=endpoint_resolution.reply_policy,
+                source_handle_id=endpoint_resolution.source_handle_id,
+                target_handle_id=endpoint_resolution.target_handle_id,
+                linked_delegated_wake_grant_id=linked_delegated_wake_grant_id,
+                legacy_context={"request_id": request_id, "dispatch_id": resolved_dispatch_id,
+                    "request_kind": request_kind, "parent_request_id": parent_request_id,
+                    "root_request_id": root_request_id, "thread_id": thread_id,
+                    "turn_index": turn_index, "linked_task_id": linked_task_id,
+                    "linked_conversation_id": linked_conversation_id,
+                    "linked_activation_id": linked_activation_id,
+                    "linked_delegated_wake_grant_id": linked_delegated_wake_grant_id,
+                    "requires_user_review": requires_user_review, "metadata": dict(metadata),
+                    "provider_backend": backend, "capture_policy": capture})
+        result = {"schema": "agent_dispatch_send.core.v1", "engine": "core",
+                "workspaceId": workspace_id, "deliveryMode": delivery_mode, "dryRun": False,
+                "queuedDispatchCreated": True, "workerRunRequested": delivery_mode == "worker_execute",
+                "workerExecuted": False, "routeSummary": route_summary,
+                "actingIdentity": acting_identity,
+                "providerBackend": backend, "capturePolicy": capture,
+                "agentDispatch": {"dispatchId": resolved_dispatch_id, "status": "queued",
+                    "messageId": message["id"], "exchangeRequestId": request_id},
+                "agentExchangeRequest": {"exchangeRequestId": request_id,
+                    "messageId": message["id"], "threadId": message["thread_id"],
+                    "sourceAgentId": message["sender"], "targetAgentId": message["target"],
+                    "requestKind": request_kind, "requestSummary": request_summary},
+                "targetHandoff": {**actions, "shellExamples": cli_shell_examples(actions)},
+                "statusCommand": _agent_dispatch_status_command(
+                    workspace_id, resolved_dispatch_id, database_path=self.settings.database,
+                    workspace_root=self.settings.workspace_root,
+                    plugins_directory=self.settings.plugins_directory,
+                    profile_path=self.settings.profile_path,
+                    agent_id=endpoint_resolution.source_agent_id)}
+        if wait_condition is not None:
+            waited = self.agent_message_wait(workspace_id=workspace_id,
+                agent_id=message["sender"], message_id=message["id"], condition=wait_condition,
+                timeout=wait_timeout_seconds)
+            return {**waited, "engine": "core", "dispatchId": resolved_dispatch_id,
+                    "exchangeRequestId": request_id, "threadId": message["thread_id"]}
+        if delivery_mode == "queued":
+            return result
+        worker_run = self.run_agent_dispatch_worker_once(
+            workspace_id=workspace_id, dispatch_id=resolved_dispatch_id,
+            actual_via="inline",
+            **worker_options)
+        result["workerRun"] = worker_run
+        result["workerExecuted"] = bool(worker_run.get("processedCount"))
+        if not worker_run.get("processedCount") and immediate_busy_policy == "return_to_sender":
+            with self._components() as components:
+                service = components.communication(workspace_id)
+                delivery = service._delivery(message)
+                if delivery["schedule"] == "pending":
+                    service.close(Caller(workspace_id, message["sender"]), message["id"],
+                        key=f"inline-not-queued:{resolved_dispatch_id}", reason="blocked")
+                    result["queuedDispatchCreated"] = False
+        status = self.get_agent_dispatch_status(workspace_id=workspace_id,
+            dispatch_id=resolved_dispatch_id,
+            requesting_agent_id=endpoint_resolution.source_agent_id)
+        result["agentDispatch"] = status["agentDispatch"]
+        result["agentExchangeRequest"] = status["agentExchangeRequest"]
+        result["deliveryDecision"] = {
+            "immediateBusyPolicy": immediate_busy_policy,
+            "queuedForFutureWorker": status["messageStatus"]["delivery"]["schedule"] == "pending",
+            "workerOutcome": worker_run["agentDispatches"][0]["outcome"]
+                if worker_run["agentDispatches"] else "no_candidate"}
+        return result
+
     def send_agent_dispatch(
         self,
         *,
@@ -665,6 +1311,7 @@ class LocalPlatformApplication:
         message: str | None = None,
         dispatch_id: str | None = None,
         exchange_request_id: str | None = None,
+        idempotency_key: str | None = None,
         acting_endpoint_alias: str | None = None,
         from_endpoint_alias: str | None = None,
         to_endpoint_alias: str | None = None,
@@ -725,7 +1372,27 @@ class LocalPlatformApplication:
         skip_busy_target: bool = True,
         read_live_runtime_status: bool | str = "auto",
         dry_run: bool = False,
+        wait_condition: str | None = None,
+        wait_timeout_seconds: float = 120,
+        target_ref: str | None = None, thread_ref: str | None = None,
+        reply_ref: str | None = None, compact_messages: bool = False,
     ) -> Mapping[str, object]:
+        core_mode = self.communication_mode(workspace_id) == "core"
+        if type(compact_messages) is not bool:
+            raise ValueError("compact_messages must be a trusted boolean option")
+        if any(reference is not None for reference in (target_ref, thread_ref, reply_ref)):
+            if not core_mode:
+                raise ValueError("short send references require an explicitly migrated core workspace")
+            if ((target_ref is not None and to_endpoint_alias is not None)
+                    or (thread_ref is not None and thread_id is not None)
+                    or (reply_ref is not None and parent_request_id is not None)):
+                raise ValueError("short send references cannot also name their full-ID or alias equivalents")
+        if wait_condition is not None:
+            from agent_os.application.services.communication_wait import CommunicationWait
+            if wait_condition not in {"ack", "final"} or not core_mode:
+                raise ValueError("ACK/final wait requires an explicitly migrated core workspace")
+            CommunicationWait.validate(wait_timeout_seconds, .1, 2, 15)
+            delivery_mode = "queued"
         if delivery_mode not in ("queued", "worker_dry_run", "worker_execute"):
             raise ValueError(
                 "deliveryMode must be one of: queued, worker_dry_run, worker_execute."
@@ -746,6 +1413,37 @@ class LocalPlatformApplication:
                 from_endpoint_alias=from_endpoint_alias,
             )
         )
+        if any(reference is not None for reference in (target_ref, thread_ref, reply_ref)):
+            from agent_os.application.services.communication_short_refs import ShortReferences
+            from agent_os.infrastructure.composition.communication_runtime import prepared_runtime
+            with prepared_runtime(self.settings, workspace_id) as (_, service):
+                reference_actor = source_agent_id
+                if resolved_source_alias is not None:
+                    source = service.directory.reader.endpoint(workspace_id, resolved_source_alias)["agentEndpoint"]
+                    if reference_actor is not None and reference_actor != source["agentId"]:
+                        raise ValueError("short-reference caller conflicts with the source alias")
+                    reference_actor = source["agentId"]
+                if reference_actor is None:
+                    raise ValueError("short send references require an explicit source agent or alias")
+                caller = Caller(workspace_id, reference_actor)
+                refs = ShortReferences(service)
+                if target_ref is not None:
+                    to_endpoint_alias = refs.target_alias(caller, target_ref)
+                if thread_ref is not None:
+                    thread_id = refs.resolve(caller, "thread", thread_ref)
+                if reply_ref is not None:
+                    reply_identity = refs.resolve(caller, "message", reply_ref)
+                    parent = service.get(caller, reply_identity)
+                    parent_request_id = parent.get("legacy_request_id")
+                    if not parent_request_id:
+                        raise ValueError("this dispatch reply-ref requires an existing legacy parent-request mapping")
+        if core_mode:
+            resolved_source_alias, to_endpoint_alias = self._core_dispatch_endpoint_aliases(
+                workspace_id=workspace_id,
+                source_agent_id=source_agent_id, target_agent_id=target_agent_id,
+                source_alias=resolved_source_alias, target_alias=to_endpoint_alias,
+                source_handle_id=source_handle_id, target_handle_id=target_handle_id,
+                target_provider=target_provider, reply_policy=reply_policy)
         endpoint_resolution = self._resolve_dispatch_endpoint_aliases(
             workspace_id=workspace_id,
             source_agent_id=source_agent_id,
@@ -777,6 +1475,72 @@ class LocalPlatformApplication:
             message_input_provided=resolved_message is not None,
             endpoint_alias_resolution=endpoint_resolution.to_metadata(),
         )
+        if core_mode:
+            worker_options = {
+                "dispatcher_id": dispatcher_id,
+                "lease_ttl_seconds": lease_ttl_seconds,
+                "retry_delay_seconds": retry_delay_seconds,
+                "handoff_directory": handoff_directory,
+                "platform_workspace_root": platform_workspace_root,
+                "config_path": config_path,
+                "claude_executable": claude_executable,
+                "claude_default_platform_workspace_add_dir": claude_default_platform_workspace_add_dir,
+                "claude_add_dirs": claude_add_dirs,
+                "claude_allowed_tools": claude_allowed_tools,
+                "claude_permission_mode": claude_permission_mode,
+                "claude_settings_path": claude_settings_path,
+                "claude_activation_backend": claude_activation_backend,
+                "claude_reply_writeback_mode": claude_reply_writeback_mode,
+                "codex_executable": codex_executable,
+                "codex_default_platform_workspace_add_dir": codex_default_platform_workspace_add_dir,
+                "codex_add_dirs": codex_add_dirs,
+                "codex_sandbox_mode": codex_sandbox_mode,
+                "codex_approval_policy": codex_approval_policy,
+                "codex_git_repo_check_policy": codex_git_repo_check_policy,
+                "codex_git_repo_check_policy_source": codex_git_repo_check_policy_source,
+                "codex_activation_backend": codex_activation_backend,
+                "codex_app_server_approval_decision": codex_app_server_approval_decision,
+                "codex_busy_delivery_policy": codex_busy_delivery_policy,
+                "codex_busy_delivery_policy_explicit": codex_busy_delivery_policy_explicit,
+                "codex_reply_writeback_mode": codex_reply_writeback_mode,
+                "hermes_executable": hermes_executable,
+                "hermes_home": hermes_home,
+                "hermes_activation_backend": hermes_activation_backend,
+                "hermes_reply_writeback_mode": hermes_reply_writeback_mode,
+                "hermes_gateway_python": hermes_gateway_python,
+                "hermes_source_tag": hermes_source_tag,
+                "hermes_max_turns": hermes_max_turns,
+                "activation_timeout_seconds": activation_timeout_seconds,
+                "skip_busy_target": skip_busy_target,
+                "read_live_runtime_status": read_live_runtime_status,
+                "compact_messages": compact_messages,
+            }
+            return self._send_agent_dispatch_core(
+                workspace_id=workspace_id, endpoint_resolution=endpoint_resolution,
+                source_alias=resolved_source_alias, target_alias=to_endpoint_alias,
+                route_summary=route_summary, acting_identity=acting_identity,
+                request_kind=resolved_request_kind, request_summary=resolved_request_summary,
+                dispatch_id=dispatch_id, exchange_request_id=exchange_request_id,
+                idempotency_key=idempotency_key,
+                detail_refs=detail_refs, linked_task_id=linked_task_id,
+                linked_conversation_id=linked_conversation_id,
+                linked_activation_id=linked_activation_id,
+                linked_delegated_wake_grant_id=linked_delegated_wake_grant_id,
+                parent_request_id=parent_request_id, root_request_id=root_request_id,
+                thread_id=thread_id, turn_index=turn_index, expires_at=expires_at,
+                requires_user_review=requires_user_review, metadata=enriched_metadata,
+                delivery_mode=delivery_mode, dry_run=dry_run,
+                claude_activation_backend=claude_activation_backend,
+                claude_reply_writeback_mode=claude_reply_writeback_mode,
+                codex_activation_backend=codex_activation_backend,
+                codex_reply_writeback_mode=codex_reply_writeback_mode,
+                hermes_activation_backend=hermes_activation_backend,
+                hermes_reply_writeback_mode=hermes_reply_writeback_mode,
+                immediate_busy_policy=immediate_busy_policy,
+                worker_options=worker_options, wait_condition=wait_condition,
+                wait_timeout_seconds=wait_timeout_seconds, target_session_ref=target_ref)
+        if idempotency_key is not None:
+            raise ValueError("idempotency key requires an explicitly migrated workspace")
         created = self.create_agent_dispatch(
             workspace_id=workspace_id,
             dispatch_id=dispatch_id,
@@ -1140,8 +1904,33 @@ class LocalPlatformApplication:
         target_agent_id: str | None = None,
         status: str | None = None,
         limit: int = 20,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core dispatch list requires an explicit requesting agent id")
+                service.directory.require_member(Caller(workspace_id, requesting_agent_id))
+                records = []
+                for message in service.repo.workspace_items("messages", workspace_id):
+                    delivery = service.repo.get("deliveries", workspace_id,
+                        delivery_identity(message["id"], message["target"]))
+                    if delivery is None or not (message.get("legacy_dispatch_id")
+                                                or delivery.get("legacy_dispatch_id")):
+                        continue
+                    if source_agent_id is not None and message["sender"] != source_agent_id:
+                        continue
+                    if target_agent_id is not None and message["target"] != target_agent_id:
+                        continue
+                    try:
+                        dispatch = self._core_request_status(service, workspace_id,
+                            message["id"], requesting_agent_id)["agentDispatch"]
+                    except AccessDenied:
+                        continue
+                    if status is None or dispatch["status"] == status:
+                        records.append(dispatch)
+                return {"engine": "core", "agentDispatches": records[-limit:]}
             return components.operations().list_agent_dispatches(
                 workspace_id,
                 source_agent_id=source_agent_id,
@@ -1158,8 +1947,24 @@ class LocalPlatformApplication:
         exchange_request_id: str | None = None,
         read_live_runtime_status: bool | str = "auto",
         waiting_response_stale_threshold_seconds: int = 600,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core dispatch status requires an explicit requesting agent id")
+                reference = exchange_request_id
+                if reference is None and dispatch_id is not None:
+                    matches = service.repo.mappings_for_legacy(workspace_id, "dispatch", dispatch_id)
+                    if len(matches) != 1:
+                        raise ValueError("dispatch has no unique core message mapping")
+                    reference = matches[0]["new_id"]
+                if reference is None:
+                    raise ValueError("core dispatch status requires a request or dispatch id")
+                return self._core_request_status(service, workspace_id, reference,
+                    requesting_agent_id, dispatch_id=dispatch_id)
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().get_agent_dispatch_status(
                 workspace_id,
                 dispatch_id=dispatch_id,
@@ -1229,6 +2034,7 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().acquire_agent_dispatch_lease(
                 workspace_id,
                 dispatch_id=dispatch_id,
@@ -1248,6 +2054,7 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().release_agent_dispatch_lease(
                 workspace_id,
                 lease_id=lease_id,
@@ -1267,6 +2074,7 @@ class LocalPlatformApplication:
         dry_run: bool = False,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().reconcile_agent_dispatch_leases(
                 workspace_id,
                 dispatch_id=dispatch_id,
@@ -1321,8 +2129,57 @@ class LocalPlatformApplication:
         skip_busy_target: bool = True,
         read_live_runtime_status: bool | str = "auto",
         dry_run: bool = False,
+        compact_messages: bool = False,
+        actual_via: str = "queued",
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                from agent_os.application.services.communication_worker import CoreCommunicationWorker
+                from agent_os.application.services.communication_provider_adapter import CoreProviderAdapter
+                adapter = CoreProviderAdapter(service, components.operations(), {
+                    "database_path": self.settings.database,
+                    "workspace_root": self.settings.workspace_root,
+                    "plugins_directory": self.settings.plugins_directory,
+                    "config_path": config_path or self.settings.profile_path,
+                    "handoff_directory": handoff_directory,
+                    "platform_workspace_root": platform_workspace_root,
+                    "claude_executable": claude_executable,
+                    "claude_default_platform_workspace_add_dir": claude_default_platform_workspace_add_dir,
+                    "claude_add_dirs": claude_add_dirs,
+                    "claude_allowed_tools": claude_allowed_tools,
+                    "claude_permission_mode": claude_permission_mode,
+                    "claude_settings_path": claude_settings_path,
+                    "claude_activation_backend": claude_activation_backend,
+                    "claude_reply_writeback_mode": claude_reply_writeback_mode,
+                    "codex_executable": codex_executable,
+                    "codex_default_platform_workspace_add_dir": codex_default_platform_workspace_add_dir,
+                    "codex_add_dirs": codex_add_dirs,
+                    "codex_sandbox_mode": codex_sandbox_mode,
+                    "codex_approval_policy": codex_approval_policy,
+                    "codex_git_repo_check_policy": codex_git_repo_check_policy,
+                    "codex_git_repo_check_policy_source": codex_git_repo_check_policy_source,
+                    "codex_activation_backend": codex_activation_backend,
+                    "codex_app_server_approval_decision": codex_app_server_approval_decision,
+                    "codex_reply_writeback_mode": codex_reply_writeback_mode,
+                    "hermes_executable": hermes_executable,
+                    "hermes_home": hermes_home,
+                    "hermes_activation_backend": hermes_activation_backend,
+                    "hermes_reply_writeback_mode": hermes_reply_writeback_mode,
+                    "hermes_gateway_python": hermes_gateway_python,
+                    "hermes_source_tag": hermes_source_tag,
+                    "hermes_max_turns": hermes_max_turns,
+                    "compact_messages": compact_messages,
+                }, actual_via=actual_via)
+                preflight = (None if dry_run or not skip_busy_target else
+                    lambda message, binding: adapter.preflight(message, binding,
+                        read_live_runtime_status=read_live_runtime_status))
+                worker = CoreCommunicationWorker(service, adapter, preflight=preflight)
+                return worker.run_once(workspace_id, dispatcher_id=dispatcher_id,
+                    limit=limit, dispatch_id=dispatch_id, target_agent_id=target_agent_id,
+                    lease_ttl_seconds=lease_ttl_seconds,
+                    provider_timeout_seconds=activation_timeout_seconds, dry_run=dry_run)
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().run_agent_dispatch_worker_once(
                 workspace_id,
                 database_path=self.settings.database,
@@ -1390,6 +2247,34 @@ class LocalPlatformApplication:
                 workspace_id
             )
 
+    @staticmethod
+    def _core_thread_metadata(service, workspace_id: str, thread_id: str,
+                              requesting_agent_id: str) -> Mapping[str, object]:
+        with service.repo.transaction(write=False):
+            caller = Caller(workspace_id, requesting_agent_id)
+            service.directory.require_member(caller)
+            thread = service.repo.get("threads", workspace_id, thread_id)
+            if thread is None:
+                return {"schema": "agent_exchange_thread.v1", "workspaceId": workspace_id,
+                    "exchangeThreadId": thread_id, "threadId": thread_id,
+                    "threadStatus": "missing", "sourceEventSequence": None}
+            thread = service._thread(caller, thread_id)
+            messages = service.repo.thread_messages(workspace_id, thread_id)
+            budget = thread.get("legacy_budget") or {}
+            return {"schema": "agent_exchange_thread.v1", "workspaceId": workspace_id,
+                "exchangeThreadId": thread_id, "threadId": thread_id,
+                "visibility": thread["visibility"],
+                "participantAgentIds": thread["participants"],
+                "threadStatus": "terminal" if thread.get("status") == "closed" else "active",
+                "rootRequestId": messages[0].get("legacy_request_id") if messages else None,
+                "maxTurns": budget.get("maxTurns"),
+                "completedTurnCount": budget.get("completedTurnCount"),
+                "activeRequestCount": budget.get("activeRequestCount"),
+                "followUpPolicy": budget.get("followUpPolicy"),
+                "sourceEventSequence": None,
+                "communicationLedgerSequence": service.repo.sequence(
+                    "threads", workspace_id, thread_id)}
+
     def list_agent_exchange_threads(
         self,
         *,
@@ -1399,6 +2284,24 @@ class LocalPlatformApplication:
         visibility: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core thread list requires an explicit requesting agent id")
+                service.directory.require_member(Caller(workspace_id, requesting_agent_id))
+                records = []
+                for thread in service.repo.workspace_items("threads", workspace_id):
+                    try:
+                        record = self._core_thread_metadata(service, workspace_id,
+                            thread["id"], requesting_agent_id)
+                    except AccessDenied:
+                        continue
+                    if status is not None and record["threadStatus"] != status:
+                        continue
+                    if visibility is not None and record["visibility"] != visibility:
+                        continue
+                    records.append(record)
+                return {"engine": "core", "agentExchangeThreads": records}
             return components.operations().list_agent_exchange_threads(
                 workspace_id,
                 requesting_agent_id=requesting_agent_id,
@@ -1414,6 +2317,13 @@ class LocalPlatformApplication:
         requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core thread status requires an explicit requesting agent id")
+                return {"engine": "core", "agentExchangeThread":
+                    self._core_thread_metadata(service, workspace_id, thread_id,
+                        requesting_agent_id)}
             return components.operations().get_agent_exchange_thread_status(
                 workspace_id,
                 thread_id=thread_id,
@@ -1428,6 +2338,19 @@ class LocalPlatformApplication:
         requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core thread requests require an explicit requesting agent id")
+                thread = self._core_thread_metadata(service, workspace_id, thread_id,
+                    requesting_agent_id)
+                if thread["threadStatus"] == "missing":
+                    raise ValueError("agent exchange thread is missing")
+                return {"engine": "core", "agentExchangeThread": thread,
+                    "agentExchangeRequests": [
+                        self._core_request_status(service, workspace_id, message["id"],
+                            requesting_agent_id)["agentExchangeRequest"]
+                        for message in service.repo.thread_messages(workspace_id, thread_id)]}
             return components.operations().list_agent_exchange_thread_requests(
                 workspace_id,
                 thread_id=thread_id,
@@ -1453,7 +2376,27 @@ class LocalPlatformApplication:
         requires_user_review: bool = False,
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
+        if self.communication_mode(workspace_id) == "core":
+            thread = self.get_agent_exchange_thread_status(workspace_id=workspace_id,
+                thread_id=thread_id, requesting_agent_id=source_agent_id)["agentExchangeThread"]
+            if thread["threadStatus"] != "active":
+                raise ValueError("agent exchange thread is not active")
+            if parent_request_id is None:
+                records = self.list_agent_exchange_thread_requests(workspace_id=workspace_id,
+                    thread_id=thread_id, requesting_agent_id=source_agent_id)["agentExchangeRequests"]
+                parent_request_id = records[-1]["exchangeRequestId"] if records else None
+            return self.create_agent_exchange_request(workspace_id=workspace_id,
+                source_agent_id=source_agent_id, target_agent_id=target_agent_id,
+                request_kind=request_kind, request_summary=request_summary,
+                exchange_request_id=exchange_request_id, parent_request_id=parent_request_id,
+                thread_id=thread_id, detail_refs=detail_refs,
+                linked_task_id=linked_task_id,
+                linked_conversation_id=linked_conversation_id,
+                linked_activation_id=linked_activation_id,
+                linked_delegated_wake_grant_id=linked_delegated_wake_grant_id,
+                requires_user_review=requires_user_review, metadata=metadata)
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             return components.operations().create_agent_exchange_thread_follow_up(
                 workspace_id,
                 thread_id=thread_id,
@@ -1482,6 +2425,15 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if metadata:
+                    raise ValueError("core thread visibility metadata is not supported")
+                service.change_thread_visibility(Caller(workspace_id, updated_by_agent_id),
+                    thread_id, visibility)
+                return {"engine": "core", "updated": True,
+                    "agentExchangeThread": self._core_thread_metadata(service, workspace_id,
+                        thread_id, updated_by_agent_id), "sourceEventSequence": None}
             return components.operations().update_agent_exchange_thread_visibility(
                 workspace_id,
                 thread_id=thread_id,
@@ -1500,6 +2452,17 @@ class LocalPlatformApplication:
         metadata: Mapping[str, object] | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if closed_by_agent_id is None:
+                    raise ValueError("core thread close requires an explicit closing agent id")
+                if metadata:
+                    raise ValueError("core thread close metadata is not supported")
+                service.close_thread(Caller(workspace_id, closed_by_agent_id),
+                    thread_id, reason=terminal_reason)
+                return {"engine": "core", "closed": True,
+                    "agentExchangeThread": self._core_thread_metadata(service, workspace_id,
+                        thread_id, closed_by_agent_id), "sourceEventSequence": None}
             return components.operations().close_agent_exchange_thread(
                 workspace_id,
                 thread_id=thread_id,
@@ -1530,6 +2493,8 @@ class LocalPlatformApplication:
         dry_run: bool = False,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            if components.communication(workspace_id) is not None:
+                raise ValueError("legacy wake watcher cannot write a core communication workspace")
             return components.operations().run_agent_wake_once(
                 workspace_id,
                 agent_id=agent_id,
@@ -1553,6 +2518,40 @@ class LocalPlatformApplication:
         limit: int = 20,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if agent_id is None:
+                    raise ValueError("core wake delivery list requires an explicit agent id")
+                caller = Caller(workspace_id, agent_id)
+                service.directory.require_member(caller)
+                entries = []
+                for message in service.repo.workspace_items("messages", workspace_id):
+                    if message["target"] != agent_id:
+                        continue
+                    if exchange_request_id is not None and message.get("legacy_request_id") != exchange_request_id:
+                        continue
+                    try:
+                        service.get(caller, message["id"])
+                    except AccessDenied:
+                        continue
+                    delivery = service._delivery(message)
+                    if status is not None and delivery["schedule"] != status:
+                        continue
+                    if wake_ticket_id is not None:
+                        continue  # Ticket identities remain separate diagnostic facts.
+                    entries.append({"schema": "agent_wake_delivery.core.v1",
+                        "workspaceId": workspace_id, "exchangeRequestId":
+                            message.get("legacy_request_id") or message["id"],
+                        "targetAgentId": agent_id, "messageId": message["id"],
+                        "status": delivery["schedule"], "delivery": delivery["delivery"],
+                        "execution": delivery["execution"], "sourceEventSequence": None,
+                        "communicationLedgerSequence": service.repo.sequence(
+                            "deliveries", workspace_id, delivery["id"])})
+                entries.reverse()
+                return {"engine": "core", "agentWakeDeliveries": entries[:limit],
+                    "count": min(len(entries), limit), "totalMatched": len(entries),
+                    "realRuntimeConnected": False, "providerPromptInjected": False,
+                    "fileBodiesRead": False, "credentialStored": False}
             return components.operations().list_agent_wake_deliveries(
                 workspace_id,
                 agent_id=agent_id,
@@ -1567,8 +2566,32 @@ class LocalPlatformApplication:
         *,
         workspace_id: str,
         exchange_request_id: str,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None:
+                    raise ValueError("core wake status requires an explicit requesting agent id")
+                identity = self._core_message_id(service, workspace_id, exchange_request_id)
+                facts = service.status(Caller(workspace_id, requesting_agent_id), identity)
+                message, delivery = facts["message"], facts["delivery"]
+                attempts = [item for item in service.repo.workspace_items("attempts", workspace_id)
+                            if item["message_id"] == identity]
+                latest = attempts[-1] if attempts else None
+                evidence = latest.get("evidence") if latest else None
+                return {"engine": "core", "agentWakeStatus": {
+                    "schema": "agent_wake_status.core.v1", "workspaceId": workspace_id,
+                    "exchangeRequestId": message.get("legacy_request_id") or identity,
+                    "requestStatus": "terminal" if facts["reply"] != "none" or delivery["closed_at"] else "active",
+                    "requestTargetAgentId": message["target"],
+                    "ticketDeliveryOccurred": False,
+                    "providerCommandStarted": bool(evidence and evidence.get("provider_command_started")),
+                    "targetResponseCompleted": facts["reply"] == "final",
+                    "coreDelivery": delivery["delivery"], "coreExecution": delivery["execution"],
+                    "sourceEventSequence": None,
+                    "communicationLedgerSequence": service.repo.sequence("deliveries", workspace_id,
+                        delivery["id"])}}
             return components.operations().get_agent_wake_status(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -1580,8 +2603,15 @@ class LocalPlatformApplication:
         workspace_id: str,
         exchange_request_id: str | None = None,
         wake_ticket_id: str | None = None,
+        requesting_agent_id: str | None = None,
     ) -> Mapping[str, object]:
         with self._components() as components:
+            service = components.communication(workspace_id)
+            if service is not None:
+                if requesting_agent_id is None or exchange_request_id is None:
+                    raise ValueError("core wake ticket lookup requires requesting agent and request id")
+                identity = self._core_message_id(service, workspace_id, exchange_request_id)
+                service.get(Caller(workspace_id, requesting_agent_id), identity)
             return components.operations().get_agent_wake_ticket(
                 workspace_id,
                 exchange_request_id=exchange_request_id,
@@ -4032,6 +5062,49 @@ class LocalPlatformApplication:
                 reason=reason,
             )
 
+    def _core_registered_session_activation(
+        self, *, workspace_id: str, agent_id: str, handle_id: str,
+        exchange_request_id: str, provider: str, backend: str, capture: str,
+        dry_run: bool, timeout_seconds: int,
+        worker_options: Mapping[str, object], result_key: str,
+    ) -> Mapping[str, object]:
+        with self._components() as components:
+            service = self._require_communication(components, workspace_id)
+            identity = self._core_message_id(service, workspace_id, exchange_request_id)
+            message = service.get(Caller(workspace_id, agent_id), identity)
+            delivery = service._delivery(message)
+            binding = delivery.get("binding") or {}
+            if (message["target"] != agent_id or binding.get("handle_id") != handle_id
+                    or binding.get("provider") != provider):
+                raise ValueError("registered activation target differs from core message binding")
+            existing_dispatch = message.get("legacy_dispatch_id") or delivery.get("legacy_dispatch_id")
+            dispatch_id = existing_dispatch or f"agent-dispatch-direct-{uuid4()}"
+            service.arm_direct_activation(workspace_id, identity,
+                target_agent_id=agent_id, handle_id=handle_id, provider=provider,
+                backend=backend, capture=capture, dispatch_id=dispatch_id,
+                dry_run=dry_run)
+            if dry_run:
+                return {"engine": "core", "dryRun": True, "workerExecuted": False,
+                    "agentDispatch": {"dispatchId": dispatch_id, "messageId": identity,
+                        "status": "dry_run"},
+                    result_key: {"status": "dry_run", "providerCommandStarted": False}}
+        run = self.run_agent_dispatch_worker_once(workspace_id=workspace_id,
+            dispatch_id=dispatch_id, limit=1,
+            activation_timeout_seconds=timeout_seconds, **worker_options)
+        item = run["agentDispatches"][0] if run["agentDispatches"] else {}
+        report = self.get_agent_dispatch_status(workspace_id=workspace_id,
+            dispatch_id=dispatch_id, requesting_agent_id=agent_id)
+        accepted = report["messageStatus"]["delivery"]["delivery"] == "accepted"
+        status = ("delivered" if item.get("processed") and item.get("outcome") == "finished" and accepted
+                  else "failed" if item.get("processed") and item.get("outcome") == "failed"
+                  else "unknown" if item.get("processed") else "skipped")
+        return {"engine": "core", "dryRun": False,
+            "workerExecuted": bool(run["processedCount"]), "workerRun": run,
+            "agentDispatch": report["agentDispatch"],
+            result_key: {"status": status,
+                "providerCommandStarted": item.get("providerCommandStarted") is True,
+                "coreWorkerOutcome": item.get("outcome")}}
+
     def activate_claude_registered_session(
         self,
         *,
@@ -4052,7 +5125,26 @@ class LocalPlatformApplication:
         dry_run: bool = True,
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
+        if self.communication_mode(workspace_id) == "core":
+            capture = reply_writeback_mode or (
+                "provider_final_capture" if activation_backend == "cli" else "explicit_only")
+            return self._core_registered_session_activation(
+                workspace_id=workspace_id, agent_id=agent_id, handle_id=handle_id,
+                exchange_request_id=exchange_request_id, provider="claude",
+                backend=activation_backend, capture=capture, dry_run=dry_run,
+                timeout_seconds=timeout_seconds,
+                worker_options={"handoff_directory": handoff_directory,
+                    "claude_executable": claude_executable,
+                    "platform_workspace_root": platform_workspace_root,
+                    "claude_default_platform_workspace_add_dir": default_platform_workspace_add_dir,
+                    "claude_add_dirs": add_dirs, "claude_allowed_tools": allowed_tools,
+                    "claude_permission_mode": permission_mode,
+                    "claude_settings_path": settings_path,
+                    "claude_activation_backend": activation_backend,
+                    "claude_reply_writeback_mode": capture},
+                result_key="claudeRegisteredSessionActivation")
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             result = components.operations().activate_claude_registered_session(
                 workspace_id,
                 agent_id=agent_id,
@@ -4179,7 +5271,27 @@ class LocalPlatformApplication:
         dry_run: bool = True,
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
+        if self.communication_mode(workspace_id) == "core":
+            return self._core_registered_session_activation(
+                workspace_id=workspace_id, agent_id=agent_id, handle_id=handle_id,
+                exchange_request_id=exchange_request_id, provider="codex",
+                backend=activation_backend, capture=reply_writeback_mode,
+                dry_run=dry_run, timeout_seconds=timeout_seconds,
+                worker_options={"handoff_directory": handoff_directory,
+                    "codex_executable": codex_executable,
+                    "platform_workspace_root": platform_workspace_root,
+                    "codex_default_platform_workspace_add_dir": default_platform_workspace_add_dir,
+                    "codex_add_dirs": add_dirs,
+                    "codex_sandbox_mode": sandbox_mode,
+                    "codex_approval_policy": approval_policy,
+                    "codex_git_repo_check_policy": git_repo_check_policy,
+                    "codex_git_repo_check_policy_source": git_repo_check_policy_source,
+                    "codex_activation_backend": activation_backend,
+                    "codex_app_server_approval_decision": app_server_approval_decision,
+                    "codex_reply_writeback_mode": reply_writeback_mode},
+                result_key="codexRegisteredSessionActivation")
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             result = components.operations().activate_codex_registered_session(
                 workspace_id,
                 agent_id=agent_id,
@@ -4414,7 +5526,24 @@ class LocalPlatformApplication:
         dry_run: bool = True,
         timeout_seconds: int = 120,
     ) -> Mapping[str, object]:
+        if self.communication_mode(workspace_id) == "core":
+            capture = reply_writeback_mode or (
+                "provider_final_capture" if activation_backend == "cli" else "explicit_only")
+            return self._core_registered_session_activation(
+                workspace_id=workspace_id, agent_id=agent_id, handle_id=handle_id,
+                exchange_request_id=exchange_request_id, provider="hermes",
+                backend=activation_backend, capture=capture, dry_run=dry_run,
+                timeout_seconds=timeout_seconds,
+                worker_options={"handoff_directory": handoff_directory,
+                    "hermes_executable": hermes_executable, "hermes_home": hermes_home,
+                    "hermes_activation_backend": activation_backend,
+                    "hermes_reply_writeback_mode": capture,
+                    "hermes_gateway_python": gateway_python,
+                    "platform_workspace_root": platform_workspace_root,
+                    "hermes_source_tag": source_tag, "hermes_max_turns": max_turns},
+                result_key="hermesRegisteredSessionActivation")
         with self._components() as components:
+            self._require_legacy_communication_route(components, workspace_id)
             result = components.operations().activate_hermes_registered_session(
                 workspace_id,
                 agent_id=agent_id,
@@ -6207,6 +7336,7 @@ def _agent_dispatch_status_command(
     workspace_root: str,
     plugins_directory: str,
     profile_path: str | None,
+    agent_id: str | None = None,
 ) -> str:
     argv = [
         *_agent_dispatch_runtime_base(
@@ -6222,6 +7352,8 @@ def _agent_dispatch_status_command(
         "--dispatch-id",
         dispatch_id,
     ]
+    if agent_id is not None:
+        argv.extend(["--agent-id", agent_id])
     return subprocess.list2cmdline(argv)
 
 
@@ -6579,26 +7711,6 @@ def _merged_texts(
     return tuple(values)
 
 
-def _required_list_text(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        raise ValueError("contact policy values must be non-empty strings.")
-    return stripped
-
-
-def _text_tuple(value: object) -> tuple[str, ...]:
-    if value is None:
-        return ()
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
-        raise ValueError("contact policy lists must be arrays of strings.")
-    result: list[str] = []
-    for item in value:
-        if not isinstance(item, str):
-            raise ValueError("contact policy lists must be arrays of strings.")
-        result.append(item)
-    return tuple(result)
-
-
 @dataclass(frozen=True, slots=True)
 class _DispatchEndpointAliasResolution:
     source_agent_id: str
@@ -6746,214 +7858,6 @@ def _normalize_dispatch_reply_policy(value: str) -> str:
             "source_handle_optional, source_handle_required."
         )
     return normalized
-
-
-def _contact_policy_profile(
-    endpoint: Mapping[str, object],
-) -> Mapping[str, tuple[str, ...]]:
-    metadata = endpoint.get("metadata")
-    profiles: list[Mapping[str, object]] = []
-    if isinstance(metadata, MappingABC):
-        for key in ("contactPolicyProfile", "contactAllowlist"):
-            value = metadata.get(key)
-            if isinstance(value, MappingABC):
-                profiles.append(value)
-        profiles.append(metadata)
-    merged: dict[str, tuple[str, ...]] = {}
-    for output_key, input_keys, normalize_alias in (
-        (
-            "allowedSourceEndpointAliases",
-            ("allowedSourceEndpointAliases", "allowSourceEndpointAliases"),
-            True,
-        ),
-        (
-            "allowedSourceAgentIds",
-            ("allowedSourceAgentIds", "allowSourceAgentIds"),
-            False,
-        ),
-        (
-            "allowedSourceProviderHandleIds",
-            (
-                "allowedSourceProviderHandleIds",
-                "allowedSourceHandleIds",
-                "allowSourceProviderHandleIds",
-                "allowSourceHandleIds",
-            ),
-            False,
-        ),
-        (
-            "blockedSourceEndpointAliases",
-            ("blockedSourceEndpointAliases", "blockSourceEndpointAliases"),
-            True,
-        ),
-        (
-            "blockedSourceAgentIds",
-            ("blockedSourceAgentIds", "blockSourceAgentIds"),
-            False,
-        ),
-        (
-            "blockedSourceProviderHandleIds",
-            (
-                "blockedSourceProviderHandleIds",
-                "blockedSourceHandleIds",
-                "blockSourceProviderHandleIds",
-                "blockSourceHandleIds",
-            ),
-            False,
-        ),
-    ):
-        values: list[str] = []
-        for profile in profiles:
-            for key in input_keys:
-                for value in _text_tuple(profile.get(key)):
-                    normalized = (
-                        normalize_agent_endpoint_alias(value)
-                        if normalize_alias
-                        else _required_list_text(value)
-                    )
-                    if normalized not in values:
-                        values.append(normalized)
-        merged[output_key] = tuple(values)
-    return merged
-
-
-def _contact_policy_source_facts(
-    source_endpoint: Mapping[str, object] | None,
-) -> Mapping[str, object]:
-    if source_endpoint is None:
-        return {
-            "sourceEndpointAlias": None,
-            "sourceAgentId": None,
-            "sourceProviderHandleId": None,
-        }
-    return {
-        "sourceEndpointAlias": source_endpoint.get("alias"),
-        "sourceAgentId": source_endpoint.get("agentId"),
-        "sourceProviderHandleId": source_endpoint.get("providerHandleId"),
-    }
-
-
-def _contact_policy_has_rules(
-    profile: Mapping[str, tuple[str, ...]],
-    prefix: str,
-) -> bool:
-    return any(values for key, values in profile.items() if key.startswith(prefix))
-
-
-def _matched_contact_policy_rules(
-    profile: Mapping[str, tuple[str, ...]],
-    *,
-    source_facts: Mapping[str, object],
-    prefix: str,
-) -> tuple[Mapping[str, object], ...]:
-    mappings = (
-        ("SourceEndpointAliases", "sourceEndpointAlias"),
-        ("SourceAgentIds", "sourceAgentId"),
-        ("SourceProviderHandleIds", "sourceProviderHandleId"),
-    )
-    matches: list[Mapping[str, object]] = []
-    for suffix, fact_key in mappings:
-        profile_key = f"{prefix}{suffix}"
-        source_value = source_facts.get(fact_key)
-        if not isinstance(source_value, str):
-            continue
-        if source_value in profile.get(profile_key, ()):
-            matches.append(
-                {
-                    "field": profile_key,
-                    "sourceFact": fact_key,
-                    "value": source_value,
-                }
-            )
-    return tuple(matches)
-
-
-def _dispatch_contact_policy_decision(
-    *,
-    source_endpoint: Mapping[str, object] | None,
-    target_endpoint: Mapping[str, object] | None,
-    reply_policy: str,
-) -> Mapping[str, object]:
-    source_facts = _contact_policy_source_facts(source_endpoint)
-    if target_endpoint is None:
-        return {
-            "schema": "agent_dispatch_contact_policy_decision.v1",
-            "targetEndpointAliasResolved": False,
-            "targetContactPolicy": None,
-            "decision": "not_applicable",
-            "requiresSourceEndpoint": False,
-            "sourceEndpointAliasResolved": source_endpoint is not None,
-            "sourceFacts": source_facts,
-        }
-    contact_policy = str(target_endpoint.get("contactPolicy") or "open")
-    if contact_policy == "block_all":
-        raise ValueError("target endpoint contactPolicy blocks incoming dispatch.")
-    contact_profile = _contact_policy_profile(target_endpoint)
-    matched_block = _matched_contact_policy_rules(
-        contact_profile,
-        source_facts=source_facts,
-        prefix="blocked",
-    )
-    if matched_block:
-        raise ValueError("target endpoint contactPolicy blocks source endpoint.")
-    requires_source_endpoint = contact_policy == "contacts_only"
-    if requires_source_endpoint and source_endpoint is None:
-        raise ValueError(
-            "target endpoint contactPolicy=contacts_only requires a source "
-            "endpoint alias."
-        )
-    matched_allow = _matched_contact_policy_rules(
-        contact_profile,
-        source_facts=source_facts,
-        prefix="allowed",
-    )
-    allowlist_configured = _contact_policy_has_rules(contact_profile, "allowed")
-    blocklist_configured = _contact_policy_has_rules(contact_profile, "blocked")
-    if requires_source_endpoint and allowlist_configured and not matched_allow:
-        raise ValueError(
-            "target endpoint contactPolicy=contacts_only does not allow source "
-            "endpoint."
-        )
-    if reply_policy != "message_only" and source_endpoint is None:
-        raise ValueError(
-            "source endpoint alias is required for reply-reachable endpoint dispatch."
-        )
-    return {
-        "schema": "agent_dispatch_contact_policy_decision.v1",
-        "targetEndpointAliasResolved": True,
-        "targetContactPolicy": contact_policy,
-        "decision": "allowed",
-        "requiresSourceEndpoint": requires_source_endpoint,
-        "sourceEndpointAliasResolved": source_endpoint is not None,
-        "allowlistConfigured": allowlist_configured,
-        "blocklistConfigured": blocklist_configured,
-        "matchedAllowlistRules": matched_allow,
-        "matchedBlocklistRules": matched_block,
-        "sourceFacts": source_facts,
-    }
-
-
-def _dispatch_reply_reachability(
-    *,
-    source_endpoint: Mapping[str, object] | None,
-    target_endpoint: Mapping[str, object] | None,
-    source_handle_id: str | None,
-    reply_policy: str,
-) -> Mapping[str, object]:
-    reply_required = reply_policy != "message_only"
-    reply_reachable = (
-        not reply_required
-        or (source_endpoint is not None and source_handle_id is not None)
-    )
-    return {
-        "schema": "agent_dispatch_reply_reachability.v1",
-        "replyPolicy": reply_policy,
-        "replyRequired": reply_required,
-        "replyReachable": reply_reachable,
-        "sourceEndpointAliasResolved": source_endpoint is not None,
-        "sourceHandleResolved": source_handle_id is not None,
-        "targetEndpointAliasResolved": target_endpoint is not None,
-    }
 
 
 @dataclass(frozen=True, slots=True)

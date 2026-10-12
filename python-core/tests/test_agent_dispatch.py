@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -17,6 +18,10 @@ if str(PROJECT_SRC) not in sys.path:
 
 from agent_os.application.services.agent_dispatch import (
     AgentDispatchRecord,
+)
+from agent_os.application.services.claude_agent_sdk_backend import (
+    ClaudeAgentSdkRunResult,
+    ClaudeAgentSdkRuntime,
 )
 from agent_os.application.services.local_platform_operations import (
     LocalPlatformOperationService,
@@ -99,6 +104,90 @@ class AgentDispatchContractTests(unittest.TestCase):
 
 
 class AgentDispatchOperationTests(unittest.TestCase):
+    def test_worker_routes_claude_agent_sdk_without_cli_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            seen: list[object] = []
+
+            def runner(config, **kwargs):
+                seen.append((config, kwargs))
+                return ClaudeAgentSdkRunResult(
+                    status="completed",
+                    sdk_version="0.2.129",
+                    provider_command_started=True,
+                    prompt_submission_attempted=True,
+                    prompt_submitted=True,
+                    session_continuity_verified=True,
+                    event_counts={"assistant": 0, "system": 1, "result": 1},
+                    final_response="worker final must remain explicit",
+                    final_response_source="result_message",
+                    result_subtype="success",
+                    cleanup_status="completed",
+                )
+
+            service = _service(
+                connection,
+                sdk_runtime_loader=lambda: ClaudeAgentSdkRuntime(
+                    status="available",
+                    installed=True,
+                    compatible=True,
+                    version="0.2.129",
+                    module=object(),
+                ),
+                sdk_runner=runner,
+            )
+            _seed_workspace(service)
+            session_id = str(uuid4())
+            service.register_claude_session_handle(
+                "workspace-dispatch",
+                agent_id="agent-b",
+                handle_id="claude-agent-sdk-handle",
+                claude_session_uuid=session_id,
+                cwd=str(root),
+                created_by="tester",
+                reason="agent SDK worker fixture",
+            )
+            service.create_agent_dispatch(
+                "workspace-dispatch",
+                dispatch_id="dispatch-claude-agent-sdk",
+                exchange_request_id="req-claude-agent-sdk",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_handle_id="claude-agent-sdk-handle",
+                target_provider="claude-code",
+                request_kind="review",
+                request_summary="Route this through the Agent SDK backend.",
+            )
+
+            result = service.run_agent_dispatch_worker_once(
+                "workspace-dispatch",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                handoff_directory=str(root / "handoff"),
+                claude_activation_backend="agent_sdk",
+                dry_run=False,
+            )
+            item = result["agentDispatches"][0]
+            activation = item["activation"]
+
+            self.assertEqual(result["processedCount"], 1)
+            self.assertEqual(activation["activationBackend"], "agent_sdk")
+            self.assertEqual(
+                activation["responseCaptureStatus"],
+                "not_attempted_explicit_only",
+            )
+            self.assertEqual(
+                item["providerBackendSelection"]["effectiveBackend"],
+                "claude_agent_sdk",
+            )
+            self.assertFalse(
+                item["providerBackendSelection"]["fallbackApplied"]
+            )
+            self.assertEqual(seen[0][0].session_id, session_id)
+
     def test_dry_run_dispatch_does_not_write_request_or_dispatch_events(self) -> None:
         connection = sqlite3.connect(":memory:")
         SqlitePlatformPersistence(connection).initialize()
@@ -264,6 +353,103 @@ class AgentDispatchOperationTests(unittest.TestCase):
             ),
             3,
         )
+
+    def test_terminal_request_projects_queued_dispatch_as_unprocessed(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        SqlitePlatformPersistence(connection).initialize()
+        service = _service(connection)
+        _seed_workspace(service)
+        service.create_agent_dispatch(
+            "workspace-dispatch",
+            dispatch_id="dispatch-terminal-before-delivery",
+            exchange_request_id="req-terminal-before-delivery",
+            source_agent_id="agent-a",
+            target_agent_id="agent-b",
+            request_kind="question",
+            request_summary="This request is answered before queued delivery.",
+        )
+        service.respond_agent_exchange_request(
+            "workspace-dispatch",
+            exchange_request_id="req-terminal-before-delivery",
+            responding_agent_id="agent-b",
+            response_summary="Answered through the explicit response path.",
+        )
+
+        status = service.get_agent_dispatch_status(
+            "workspace-dispatch",
+            dispatch_id="dispatch-terminal-before-delivery",
+        )
+
+        self.assertEqual(status["agentDispatch"]["status"], "queued")
+        self.assertEqual(status["effectiveDispatchStatus"], "terminal_unprocessed")
+        self.assertEqual(
+            status["dispatchStateProjection"]["reasonCode"],
+            "request_responded_before_delivery",
+        )
+        self.assertTrue(status["dispatchStateProjection"]["terminalUnprocessed"])
+        self.assertFalse(status["dispatchStateProjection"]["workerEligible"])
+        self.assertEqual(status["recommendedAction"], "none_terminal_unprocessed")
+
+        self.assertEqual(
+            service.list_agent_dispatches(
+                "workspace-dispatch",
+                status="queued",
+            )["count"],
+            0,
+        )
+        projected = service.list_agent_dispatches(
+            "workspace-dispatch",
+            status="terminal_unprocessed",
+        )
+        self.assertEqual(projected["count"], 1)
+        self.assertEqual(projected["agentDispatches"][0]["status"], "queued")
+        self.assertEqual(
+            projected["agentDispatches"][0]["effectiveStatus"],
+            "terminal_unprocessed",
+        )
+
+        worker = service.run_agent_dispatch_worker_once(
+            "workspace-dispatch",
+            database_path="unused.sqlite3",
+            workspace_root="unused-workspace",
+            plugins_directory="unused-plugins",
+            dry_run=False,
+        )
+        self.assertEqual(worker["candidateCount"], 0)
+        self.assertEqual(worker["processedCount"], 0)
+
+    def test_closed_request_is_not_selected_from_legacy_queue(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        SqlitePlatformPersistence(connection).initialize()
+        service = _service(connection)
+        _seed_workspace(service)
+        service.create_agent_dispatch(
+            "workspace-dispatch",
+            dispatch_id="dispatch-closed-before-delivery",
+            exchange_request_id="req-closed-before-delivery",
+            source_agent_id="agent-a",
+            target_agent_id="agent-b",
+            request_kind="handoff",
+            request_summary="This request is closed before queued delivery.",
+        )
+        service.close_agent_exchange_request(
+            "workspace-dispatch",
+            exchange_request_id="req-closed-before-delivery",
+            terminal_reason="closed",
+        )
+
+        status = service.get_agent_dispatch_status(
+            "workspace-dispatch",
+            dispatch_id="dispatch-closed-before-delivery",
+        )
+
+        self.assertEqual(status["agentDispatch"]["status"], "queued")
+        self.assertEqual(status["effectiveDispatchStatus"], "terminal_unprocessed")
+        self.assertEqual(
+            status["dispatchStateProjection"]["reasonCode"],
+            "request_closed_before_delivery",
+        )
+        self.assertFalse(status["dispatchStateProjection"]["pending"])
 
     def test_lease_blocks_same_target_handle_until_released(self) -> None:
         connection = sqlite3.connect(":memory:")
@@ -988,6 +1174,198 @@ class AgentDispatchOperationTests(unittest.TestCase):
                 self.assertEqual(backoff["busyRetryDelaySeconds"], expected_delay)
             self.assertEqual(observed_delays, [5, 15, 30, 60, 60])
 
+    def test_codex_busy_reject_policy_fails_deterministically_without_steering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(connection)
+            _seed_workspace(service)
+            service.register_codex_session_handle(
+                "workspace-dispatch",
+                agent_id="agent-b",
+                handle_id="codex-busy-reject-handle",
+                codex_session_id="codex-busy-reject-session",
+                cwd=str(root),
+                created_by="user",
+                reason="busy reject fixture",
+                metadata={
+                    "providerRuntimeStatus": {
+                        "threadStatus": "running",
+                        "threadId": "codex-thread-busy-reject",
+                    }
+                },
+            )
+            service.create_agent_dispatch(
+                "workspace-dispatch",
+                dispatch_id="dispatch-busy-reject",
+                exchange_request_id="req-busy-reject",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_handle_id="codex-busy-reject-handle",
+                target_provider="codex-cli",
+                request_kind="review",
+                request_summary="Reject while target is busy.",
+            )
+
+            result = service.run_agent_dispatch_worker_once(
+                "workspace-dispatch",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                codex_busy_delivery_policy="reject",
+                dry_run=False,
+            )
+
+            self.assertEqual(result["processedCount"], 1)
+            self.assertEqual(result["skippedCount"], 0)
+            self.assertEqual(result["codexBusyDeliveryPolicy"], "reject")
+            item = result["agentDispatches"][0]
+            self.assertEqual(item["finalStatus"], "failed")
+            self.assertEqual(
+                item["failureCategory"],
+                "codex_target_busy_rejected_by_policy",
+            )
+            self.assertNotIn("activation", item)
+            status = service.get_agent_dispatch_status(
+                "workspace-dispatch",
+                dispatch_id="dispatch-busy-reject",
+            )
+            self.assertEqual(status["agentDispatch"]["status"], "failed")
+            self.assertEqual(status["agentDispatch"]["attemptCount"], 1)
+            self.assertEqual(status["agentDispatch"]["busySkipCount"], 0)
+
+    def test_immediate_busy_policy_returns_provider_neutral_sender_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(connection)
+            _seed_workspace(service)
+            service.register_codex_session_handle(
+                "workspace-dispatch",
+                agent_id="agent-b",
+                handle_id="codex-immediate-busy-handle",
+                codex_session_id="codex-immediate-busy-session",
+                cwd=str(root),
+                created_by="user",
+                reason="immediate busy fixture",
+                metadata={
+                    "providerRuntimeStatus": {
+                        "threadStatus": "running",
+                        "threadId": "codex-immediate-busy-thread",
+                    }
+                },
+            )
+            service.create_agent_dispatch(
+                "workspace-dispatch",
+                dispatch_id="dispatch-immediate-busy",
+                exchange_request_id="req-immediate-busy",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_handle_id="codex-immediate-busy-handle",
+                target_provider="codex",
+                request_kind="question",
+                request_summary="Can you answer now?",
+            )
+
+            result = service.run_agent_dispatch_worker_once(
+                "workspace-dispatch",
+                database_path=str(root / "platform.sqlite3"),
+                workspace_root=str(root / "workspace"),
+                plugins_directory=str(root / "plugins"),
+                immediate_busy_policy="return_to_sender",
+                dry_run=False,
+            )
+
+            self.assertEqual(result["processedCount"], 1)
+            self.assertEqual(result["skippedCount"], 0)
+            item = result["agentDispatches"][0]
+            self.assertEqual(item["finalStatus"], "failed")
+            self.assertEqual(
+                item["failureCategory"],
+                "target_busy_requires_sender_decision",
+            )
+            self.assertEqual(item["agentDispatch"]["busySkipCount"], 0)
+            self.assertIsNone(item["agentDispatch"]["nextAttemptAfter"])
+            self.assertFalse(item["agentDispatch"]["providerActivationExecuted"])
+
+    def test_immediate_app_server_busy_is_terminal_sender_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = sqlite3.connect(":memory:")
+            SqlitePlatformPersistence(connection).initialize()
+            service = _service(connection)
+            _seed_workspace(service)
+            service.register_codex_session_handle(
+                "workspace-dispatch",
+                agent_id="agent-b",
+                handle_id="codex-app-server-busy-handle",
+                codex_session_id="codex-app-server-busy-session",
+                cwd=str(root),
+                created_by="user",
+                reason="app-server busy fixture",
+                metadata={
+                    "providerRuntimeStatus": {
+                        "threadStatus": "idle",
+                        "threadId": "codex-app-server-busy-thread",
+                    }
+                },
+            )
+            service.create_agent_dispatch(
+                "workspace-dispatch",
+                dispatch_id="dispatch-app-server-busy",
+                exchange_request_id="req-app-server-busy",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_handle_id="codex-app-server-busy-handle",
+                target_provider="codex",
+                request_kind="question",
+                request_summary="Start only when the native thread is idle.",
+            )
+            activation_result = {
+                "codexRegisteredSessionActivation": {
+                    "status": "failed",
+                    "activationBackend": "app_server",
+                    "providerTransport": "stdio",
+                    "providerCommandStarted": True,
+                    "targetResponseCompleted": False,
+                    "failureCategory": "app_server_thread_busy",
+                    "failureReason": "thread/read reported active",
+                    "retryable": True,
+                    "initialThreadStatus": "active",
+                }
+            }
+
+            with patch.object(
+                LocalPlatformOperationService,
+                "_activate_agent_dispatch_provider",
+                return_value=activation_result,
+            ) as activate:
+                result = service.run_agent_dispatch_worker_once(
+                    "workspace-dispatch",
+                    database_path=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "workspace"),
+                    plugins_directory=str(root / "plugins"),
+                    codex_activation_backend="app_server",
+                    immediate_busy_policy="return_to_sender",
+                    dry_run=False,
+                )
+
+            activate.assert_called_once()
+            item = result["agentDispatches"][0]
+            self.assertEqual(item["finalStatus"], "failed")
+            self.assertEqual(
+                item["failureCategory"],
+                "target_busy_requires_sender_decision",
+            )
+            self.assertEqual(
+                item["providerFailureCategory"],
+                "app_server_thread_busy",
+            )
+            self.assertIsNone(item["agentDispatch"]["nextAttemptAfter"])
+            self.assertEqual(item["agentDispatch"]["attemptCount"], 1)
+
     def test_worker_skips_live_probe_busy_target_runtime_without_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1492,6 +1870,8 @@ class AgentDispatchApplicationTests(unittest.TestCase):
                 from_endpoint_alias="codex-source",
                 to_endpoint_alias="hermes-target",
                 message="Review via endpoint aliases.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
 
             dispatch = result["agentDispatch"]
@@ -1549,6 +1929,127 @@ class AgentDispatchApplicationTests(unittest.TestCase):
                 result["agentExchangeRequest"]["requestSummary"],
                 "Review via endpoint aliases.",
             )
+            self.assertEqual(result["deliveryDecision"]["outcome"], "queued")
+            self.assertFalse(result["deliveryDecision"]["immediateAttempt"])
+            self.assertEqual(
+                result["deliveryDecision"]["targetStateBeforeAttempt"],
+                "not_checked",
+            )
+
+    def test_send_dispatch_default_dry_run_plans_bounded_worker_without_writes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-default-send",
+                display_name="Default Send Workspace",
+                root_path=str(root),
+                agent_id="agent-a",
+            )
+            app.create_agent(
+                workspace_id="workspace-default-send",
+                agent_id="agent-b",
+                name="Agent B",
+                description="Target agent.",
+            )
+
+            result = app.send_agent_dispatch(
+                workspace_id="workspace-default-send",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_provider="codex",
+                message="Confirm receipt.",
+                dry_run=True,
+            )
+
+            self.assertEqual(result["deliveryMode"], "worker_execute")
+            self.assertTrue(result["workerRunRequested"])
+            self.assertFalse(result["workerExecuted"])
+            decision = result["deliveryDecision"]
+            self.assertEqual(decision["schema"], "agent_dispatch_delivery_decision.v1")
+            self.assertEqual(decision["effectiveMode"], "worker_execute")
+            self.assertEqual(decision["modeSource"], "default")
+            self.assertEqual(decision["outcome"], "unknown")
+            self.assertFalse(decision["deliveryAttempted"])
+            self.assertEqual(
+                app.list_agent_dispatches(
+                    workspace_id="workspace-default-send",
+                    limit=20,
+                )["agentDispatches"],
+                [],
+            )
+
+    def test_send_dispatch_default_returns_busy_decision_without_queue_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = LocalPlatformApplication(
+                LocalPlatformSettings(
+                    database=str(root / "platform.sqlite3"),
+                    workspace_root=str(root / "workspace"),
+                    plugins_directory=str(root / "plugins"),
+                )
+            )
+            app.create_workspace(
+                workspace_id="workspace-busy-send",
+                display_name="Busy Send Workspace",
+                root_path=str(root),
+                agent_id="agent-a",
+            )
+            app.create_agent(
+                workspace_id="workspace-busy-send",
+                agent_id="agent-b",
+                name="Agent B",
+                description="Busy target.",
+            )
+            app.register_codex_session_handle(
+                workspace_id="workspace-busy-send",
+                agent_id="agent-b",
+                handle_id="codex-busy-send-handle",
+                codex_session_id="codex-busy-send-session",
+                cwd=str(root),
+                created_by="user",
+                reason="busy send fixture",
+                metadata={
+                    "providerRuntimeStatus": {
+                        "threadStatus": "running",
+                        "threadId": "codex-busy-send-thread",
+                    }
+                },
+            )
+
+            result = app.send_agent_dispatch(
+                workspace_id="workspace-busy-send",
+                source_agent_id="agent-a",
+                target_agent_id="agent-b",
+                target_handle_id="codex-busy-send-handle",
+                target_provider="codex",
+                message="Confirm whether you are available.",
+            )
+
+            decision = result["deliveryDecision"]
+            self.assertEqual(decision["outcome"], "busy_returned")
+            self.assertTrue(decision["busyDecisionRequired"])
+            self.assertEqual(
+                decision["normalizedFailureCategory"],
+                "target_busy_requires_sender_decision",
+            )
+            self.assertEqual(
+                decision["availableActions"],
+                ["queue_next_turn", "cancel"],
+            )
+            self.assertFalse(decision["providerCommandStarted"])
+            self.assertEqual(result["agentDispatch"]["status"], "failed")
+            self.assertIsNone(result["agentDispatch"]["nextAttemptAfter"])
 
     def test_send_dispatch_rejects_endpoint_alias_conflicts_and_wrong_direction(
         self,
@@ -1747,6 +2248,8 @@ class AgentDispatchApplicationTests(unittest.TestCase):
                 reply_policy="message_only",
                 request_kind="review",
                 request_summary="Message-only dispatch.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
             self.assertFalse(
                 message_only["endpointAliasResolution"]["replyReachability"][
@@ -1787,6 +2290,8 @@ class AgentDispatchApplicationTests(unittest.TestCase):
                 to_endpoint_alias="hermes-contacts",
                 request_kind="review",
                 request_summary="Contacts-only with source endpoint.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
             self.assertEqual(
                 contacts_allowed["endpointAliasResolution"][
@@ -1898,6 +2403,8 @@ class AgentDispatchApplicationTests(unittest.TestCase):
                 to_endpoint_alias="hermes-contacts-listed",
                 request_kind="review",
                 request_summary="Allowed by contact allowlist.",
+                delivery_mode="queued",
+                delivery_mode_source="explicit_cli",
             )
 
             decision = allowed["endpointAliasResolution"]["contactPolicyDecision"]
@@ -2090,7 +2597,17 @@ def _seed_workspace(service: LocalPlatformOperationService) -> None:
     )
 
 
-def _service(connection: sqlite3.Connection) -> LocalPlatformOperationService:
+def _service(
+    connection: sqlite3.Connection,
+    *,
+    sdk_runtime_loader=None,
+    sdk_runner=None,
+) -> LocalPlatformOperationService:
+    kwargs = {}
+    if sdk_runtime_loader is not None:
+        kwargs["claude_agent_sdk_runtime_loader"] = sdk_runtime_loader
+    if sdk_runner is not None:
+        kwargs["claude_agent_sdk_runner"] = sdk_runner
     return LocalPlatformOperationService(
         workspace_reader=SqliteWorkspaceStateStore(connection),
         context_reader=SqliteContextStateStore(connection),
@@ -2108,6 +2625,7 @@ def _service(connection: sqlite3.Connection) -> LocalPlatformOperationService:
         agent_registration_writer=SqliteAgentRegistrationStateStore(connection),
         conversation_session_writer=SqliteConversationStore(connection),
         conversation_message_writer=SqliteConversationStore(connection),
+        **kwargs,
     )
 
 

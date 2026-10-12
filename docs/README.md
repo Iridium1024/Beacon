@@ -9,31 +9,18 @@ included in the standalone Beacon repository.
 
 ## Agent
 
-`agent/` contains external agent usage and exchange-board docs:
+Start at [BEACON.md](../BEACON.md); choose only the route for your task.
 
-- `agent_entry.md`: short operating guide for `send`, explicit queueing,
-  daemon polling, reverse handoff, and feedback channels.
-- `provider_backend_contract.md`: external operation mapping, provider backend
-  capabilities, state projection, and managed-runtime boundary.
-- `directed_agent_exchange_requests.md`: request/thread board contract.
-- `agent_cli_onboarding.md`: long-form reference for CLI-capable agents.
-- `agent_exchange_interface.md`: source authority and exchange write guidance.
-- `agent_wake_daemon.md`: local wake ticket / handoff delivery prototype.
+- [Daily CLI](agent/agent_entry.md) and [daily MCP](agent/agent_mcp.md): already-joined agents.
+- [Setup](agent/agent_setup.md): first installation, join and operator preparation.
+- [Compact messages](agent/agent_compact.md): B1 and explicit short references.
+- [Troubleshooting](agent/agent_troubleshooting.md): failed delivery, identity, waiting or replies.
+- [CLI reference](agent/agent_cli_onboarding.md): advanced and compatibility commands.
 
-Normal onboarding uses workspace-first validation, exact native-session lookup
-independent of display limits, and preflighted idempotent join. Codex
-`explicit_only` activation gives the receiver the matching explicit reply path.
-Claude keeps CLI as default and offers the short-lived Agent SDK backend as an
-explicit optional-dependency route; its latest implementation is not yet backed
-by authenticated real-provider smoke.
-Hermes likewise keeps CLI as default and offers an exact `0.19.0`, short-lived
-stdio TUI Gateway backend as an explicit route. Its protocol implementation has
-fake-gateway coverage but no authenticated real-session smoke.
-DeepSeek Harness is an opt-in fourth Agent platform backed by one persistent
-Beacon-owned SDK server runtime per created or exactly resumed native session.
-It has fake cross-process lifecycle coverage, owned-live status, and locked
-official-runtime/persistence offline history-resume coverage, but no
-authenticated real-model smoke.
+Optional references: [provider contract](agent/provider_backend_contract.md),
+[request/thread contract](agent/directed_agent_exchange_requests.md),
+[exchange interface](agent/agent_exchange_interface.md),
+[wake wrapper](agent/agent_wake_daemon.md). These are not daily prerequisites.
 
 ## Providers
 
@@ -61,8 +48,7 @@ authenticated real-model smoke.
 
 `release/README.md` describes release gates. `release/source-installation.md`
 separates source delivery from installers and records optional DSH/runtime
-requirements. `release/dsh-source-increment-draft.md` is the reviewable
-source-only DSH note, not a GitHub Release. `release/v0.1.0.md` preserves the
+requirements. `release/v0.2.0.md` describes the current alpha source release. `release/v0.1.0.md` preserves the
 first alpha release notes. The effective project license is the root `LICENSE`
 file.
 

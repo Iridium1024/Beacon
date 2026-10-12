@@ -1,0 +1,73 @@
+# P3-A read-only console overlay. This bundle applies after the official
+# dsh-base and dsh-web-app bundles. It keeps transport/runtime/theme/layout and
+# removes every shipped browser surface that exposes or implies mutation.
+
+- id: ui-sidebar
+  disabled: true
+- id: ui-settings-general
+  disabled: true
+- id: ui-settings-models
+  disabled: true
+- id: ui-settings-plugin-inventory
+  disabled: true
+- id: ui-conversation
+  disabled: true
+- id: ui-brand-official
+  disabled: true
+- id: ui-attachment
+  disabled: true
+- id: ui-tool
+  disabled: true
+- id: ui-cordis
+  disabled: true
+- id: ui-workflow-run
+  disabled: true
+- id: ui-deliverables
+  disabled: true
+- id: ui-workspace
+  disabled: true
+- id: ui-input-trigger
+  disabled: true
+- id: ui-commands
+  disabled: true
+- id: ui-skill
+  disabled: true
+- id: ui-subagent
+  disabled: true
+- id: ui-reference
+  disabled: true
+- id: ui-jobs
+  disabled: true
+- id: ui-goal
+  disabled: true
+- id: ui-message-feedback
+  disabled: true
+- id: ui-model-selection
+  disabled: true
+- id: ui-permission
+  disabled: true
+- id: ui-agent-preset
+  disabled: true
+- id: ui-settings-plugins
+  disabled: true
+- id: ui-plan
+  disabled: true
+- id: ui-user-questions
+  disabled: true
+- id: ui-trajectory
+  disabled: true
+
+- insert:
+    - id: beacon-session-console
+      name: '@beacon-local/dsh-session-console'
+      inject: [webServer]
+      config:
+        mode: !!js process.env.BEACON_CONSOLE_MODE ?? 'fake'
+        bridgeBaseUrl: !!js process.env.BEACON_CONSOLE_GATEWAY_URL ?? 'http://127.0.0.1:4311'
+        fixturePath: !!js process.env.BEACON_CONSOLE_FIXTURE_PATH
+        timeoutMs: !!js >-
+          process.env.BEACON_CONSOLE_TIMEOUT_MS ?
+          Number(process.env.BEACON_CONSOLE_TIMEOUT_MS) : undefined
+        maxResponseBytes: !!js >-
+          process.env.BEACON_CONSOLE_MAX_RESPONSE_BYTES ?
+          Number(process.env.BEACON_CONSOLE_MAX_RESPONSE_BYTES) : undefined

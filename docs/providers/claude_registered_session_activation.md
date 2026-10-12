@@ -1,11 +1,16 @@
 # Claude Registered Session Activation
 
+For ordinary messages use [daily CLI](../agent/agent_entry.md) or
+[daily MCP](../agent/agent_mcp.md). This page is optional setup/troubleshooting
+reference; read only the section for your provider task.
+
 Status: advanced supported provider activation path.
 
 This document describes the local Claude Code registered-session activation
 path. It lets a user or already-onboarded advanced agent register one explicit
 Claude Code session handle, then ask the local platform to deliver a wake
-ticket to that handle through the official Claude CLI resume route.
+ticket through either the default Claude CLI resume route or the opt-in public
+Claude Agent SDK route.
 
 This is autonomous local handoff. It is not browser, desktop, IDE, TUI, tmux,
 Remote Control, WebSocket, LAN/public endpoint, credential-store, or provider
@@ -18,8 +23,8 @@ history.
   handle for one workspace `agentId`.
 - Resolves the platform-managed shared workspace for that `workspaceId` and
   grants it to the resumed Claude process with `--add-dir`.
-- Renders the official resume command plus the bounded local permission
-  options recorded in the activation audit:
+- By default, renders the official CLI resume command plus the bounded local
+  permission options recorded in the activation audit:
 
 ```text
 claude --resume <CLAUDE_SESSION_UUID> --add-dir <PLATFORM_WORKSPACE_ROOT> --print --output-format stream-json --verbose
@@ -28,9 +33,14 @@ claude --resume <CLAUDE_SESSION_UUID> --add-dir <PLATFORM_WORKSPACE_ROOT> --prin
 - Builds a normal platform wake ticket for the target request.
 - Sends Claude a controlled stdin handoff that points at the wake ticket path
   and the platform CLI read/respond commands.
-- Attempts a bounded stdout auto-capture fallback: if Claude exits
-  successfully, the request is still active, and Claude emitted final text in
-  `stream-json`, the platform records that text as the target agent's response.
+- Retains the CLI route's historical bounded stdout auto-capture default.
+- When `agent_sdk` is selected, creates one short-lived `ClaudeSDKClient`,
+  passes the exact registered UUID through `resume`, preserves cwd/additional
+  directories/explicit permission options, consumes typed events, and always
+  attempts bounded interrupt/cleanup on failure.
+- Defaults SDK final-message writeback to `explicit_only`; provider execution
+  may complete while the Beacon request remains active for a receiver-selected
+  `agent-reply`.
 - Records append-only audit for:
   - ticket delivery;
   - provider command started;
@@ -39,6 +49,120 @@ claude --resume <CLAUDE_SESSION_UUID> --add-dir <PLATFORM_WORKSPACE_ROOT> --prin
   - target response completion, which is true when the target agent responds
     through the platform request API or when stdout auto-capture records a
     fallback response.
+
+## Official Programmatic Interface And Current Boundary
+
+Claude publishes the Python/TypeScript
+[Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview), which exposes
+Claude Code as a library. Its streaming client can resume a local session id
+with the matching cwd, receive typed events, interrupt active work, participate
+in permission decisions, and control SDK-configured MCP servers. Beacon now
+implements the Python SDK's public surface as opt-in backend id
+`claude_agent_sdk`. `claude_cli` remains the default and explicit rollback.
+
+The SDK implementation is operation-owned and short-lived: one client resumes
+one registered session, submits one prompt, consumes one result stream, and
+disconnects. Beacon does not keep an SDK stream alive, own a persistent Claude
+runtime, queue active-turn input, expose public supplement/cancel/status
+operations, or read complete session history. Internal timeout interrupt is a
+cleanup action, not a caller-facing cancel contract.
+
+Claude Managed Agents is a separate hosted REST/SSE product. Its sessions and
+events do not attach to the existing local Claude Code transcript registered by
+this path, so it is not a drop-in replacement for either local backend. The SDK
+route uses the public SDK rather than an undocumented raw control protocol.
+Beacon does not collect credentials or offer third-party Claude subscription
+login; API-key/cloud-provider authentication remains provider-owned and must be
+configured outside Beacon.
+See [`provider_programmatic_interfaces.md`](provider_programmatic_interfaces.md)
+for the shared status vocabulary and integration rules.
+
+## Backend Selection, Install, And Rollback
+
+The generated local profile records only the compatibility default:
+
+```json
+{
+  "localRuntime": {
+    "claudeControl": {
+      "activationBackend": "cli"
+    }
+  }
+}
+```
+
+Supported fields are `activationBackend` (`cli` or `agent_sdk`) and
+`replyWritebackMode` (`explicit_only` or `provider_final_capture`). Explicit
+CLI options win over nested `localRuntime.claudeControl`; compatible flat
+aliases are still read and identified in output. If writeback is omitted, CLI
+uses `provider_final_capture` for historical compatibility and Agent SDK uses
+the safer `explicit_only` default.
+
+Install the SDK only when selecting the opt-in backend:
+
+```powershell
+py -3.11 -m pip install -e ".\python-core[claude-agent-sdk]"
+```
+
+Beacon accepts `claude-agent-sdk>=0.2.127,<0.3.0`. Preflight checks the installed
+distribution version and required public symbols without starting a session:
+
+```powershell
+beacon --profile "<PROFILE_PATH>" agent-runtime-preflight --tool claude
+```
+
+The report contains
+`activationCapabilities.providerProtocolChecks.claudeAgentSdk`. Missing,
+unsupported, or incompatible SDK packages fail before a wake ticket is written
+or delivery is recorded. Beacon never silently falls back to the CLI. Roll back
+explicitly by selecting `cli` or removing the SDK selection.
+
+The compatibility audit anchor is Claude Agent SDK `0.2.144`; it is neither a
+new minimum version nor evidence of a provider smoke. Preflight reports newer
+public surfaces as additive `optionalCapabilities`: `ConversationResetMessage`
+and `ResultMessage.origin` (introduced in `0.2.137`) and `ResultError`
+(introduced in `0.2.140`). Their absence on an older supported SDK does not make
+that SDK incompatible. The mandatory symbol set and dependency range remain
+unchanged.
+
+When those optional signals are present, the operation is fail-closed:
+
+- `ResultError` is recorded as a structured `sdk_result_error`, including only
+  bounded normalized kind, exit/API context, terminal reason, and whether an
+  earlier error `ResultMessage` was observed. Arbitrary provider error bodies
+  are not copied into the structured failure summary, and the failure is not
+  treated as ambiguous delivery merely because it is a `ResultError`.
+- Any `ConversationResetMessage` invalidates exact registered-session
+  continuity, triggers bounded interrupt, rejects later final/result events,
+  and returns `sdk_conversation_reset`. Beacon never replaces the registered
+  UUID with the reset's conversation id or a later session id.
+- On an origin-aware `ResultMessage`, only a missing/`None` origin or
+  `{"kind": "human"}` may supply a final response. Background, injected, and
+  unknown non-empty origins return `sdk_untrusted_result_origin`. Older SDK
+  message shapes without the `origin` field retain the established behavior.
+
+Direct dry-run selection:
+
+```powershell
+beacon --profile "<PROFILE_PATH>" `
+  claude-registered-session-activate `
+  --agent-id "<TARGET_AGENT_ID>" `
+  --handle-id "<RETURNED_HANDLE_ID>" `
+  --exchange-request-id "<REQUEST_ID>" `
+  --claude-activation-backend agent_sdk `
+  --dry-run
+```
+
+The same `--claude-activation-backend` and
+`--claude-reply-writeback-mode` options are accepted by `agent-dispatch-send`,
+`agent-dispatch-worker-run-once`, and `agent-dispatch-daemon-start`, and are
+forwarded to the daemon process. Selection output reports requested/effective
+backend with `fallbackApplied=false`.
+
+This implementation has `0.2.144`-shape fake-SDK, integration, and regression
+coverage, but no authenticated real-provider/session smoke has been run for
+the refreshed Agent SDK backend. Do not interpret a passing preflight,
+`dry_run`, or source-package inspection as that smoke.
 
 ## Register A Handle
 
@@ -124,8 +248,8 @@ subdirectories. A typical layout is:
   links/<link-id>/
 ```
 
-The current Claude adapter defaults to adding that shared root to the resumed
-Claude process:
+Both Claude backends default to adding that shared root to the resumed Claude
+operation (`--add-dir` for CLI and `add_dirs` for Agent SDK):
 
 ```text
 --add-dir <PLATFORM_WORKSPACE_ROOT>
@@ -193,8 +317,8 @@ workspace.
 
 ## Execute Activation
 
-Execution starts a local Claude CLI process with `shell=false`, the registered
-cwd, and controlled stdin.
+Execution starts the selected short-lived backend with the registered cwd and
+controlled wake-ticket prompt. The default CLI route uses `shell=false`.
 
 ```powershell
 beacon --profile "<PROFILE_PATH>" `
@@ -206,10 +330,11 @@ beacon --profile "<PROFILE_PATH>" `
   --execute
 ```
 
-The command writes a wake ticket, records wake delivery, starts Claude through
-`--resume`, and records the activation attempt. The preferred completion path is
-still that the target Claude agent reads the request/thread and responds through
-`agent-exchange-request-respond`.
+The command writes a wake ticket, records wake delivery, resumes the exact
+registered UUID, and records the activation attempt. Agent SDK additionally
+records bounded typed-event counts, prompt-submission state, result subtype,
+terminal reason, permission decisions, interrupt/cleanup outcome, and
+ambiguity/review flags. It never stores a full provider transcript.
 
 If Claude cannot run the platform response command because the CLI session is
 waiting for tool permission, the interaction may stop at that permission
@@ -218,19 +343,21 @@ registered-session activation. The target agent should confirm whether it is
 allowed to run the platform CLI read/respond commands; otherwise the request
 may remain active and require manual review.
 
-An experimental stdout auto-capture fallback exists for later validation. It
+The CLI compatibility route retains stdout auto-capture. It
 parses Claude's captured `stream-json` stdout after the process exits and can
 write a non-empty final answer through the normal request response path with
 metadata `responseSource=claude_stdout_auto_capture`. Do not rely on this as the
 current completion path: real-session smoke has shown that permission-blocked
 interactions may produce no capturable stdout text. This fallback does not read
 or export complete Claude session history and does not grant Claude additional
-tool permissions.
+tool permissions. Agent SDK captures a verified successful `ResultMessage`
+only when `provider_final_capture` is explicitly selected; its default
+`explicit_only` mode leaves the response to the target agent.
 
 ## Current Bootstrap Behavior
 
-Registered-session activation is still a bootstrap/smoke-stage path. Operators
-should expect some friction until a later profile/adapter optimization step:
+Real-provider registered-session activation remains an advanced path. Operators
+should preserve the following smoke and compatibility boundaries:
 
 - For real target-agent smoke tests, keep the smoke database, plugins directory,
   and wake-ticket handoff directory under the registered project root, for
@@ -245,12 +372,14 @@ should expect some friction until a later profile/adapter optimization step:
   still stop at Claude Code's tool-approval boundary. Design smoke success
   criteria accordingly.
 - The first resume attempt can take noticeable time because it starts a fresh
-  local Claude CLI process and lets Claude reload the project/session state.
+  local Claude operation and lets Claude reload the project/session state.
 - The controlled stdin handoff is intentionally verbose today. It includes the
   ticket path, database path, workspace root, plugins directory, and read/respond
   commands so an unconfigured target session can act without hidden local state.
-- On Windows, use `claude.cmd` for Python `subprocess` execution. PowerShell's
-  `claude.ps1` wrapper is not directly executable with `shell=false`.
+- On Windows CLI rollback, use `claude.cmd` for Python `subprocess` execution.
+  PowerShell's `claude.ps1` wrapper is not directly executable with
+  `shell=false`. Agent SDK uses its bundled executable unless an explicit
+  `--claude-executable`/`cli_path` override is supplied.
 - Claude Code 2.1.193 requires `--verbose` with
   `--output-format stream-json`.
 - Some wrapper scripts may see non-JSON text if an external CLI prints an error
@@ -317,17 +446,24 @@ beacon --profile "<PROFILE_PATH>" `
 Important fields:
 
 - `ticketDeliveryOccurred`: a platform wake ticket was delivered.
-- `providerCommandStarted`: a Claude CLI resume command was started.
-- `sessionContinuityVerified`: Claude output contained the registered session
-  UUID.
+- `activationBackend`: `cli` or `agent_sdk`.
+- `replyWritebackMode`: effective backend-specific writeback policy.
+- `providerCommandStarted`: the selected Claude operation was started.
+- `sessionContinuityVerified`: CLI output contained the registered UUID, or the
+  SDK result/event id exactly matched it.
 - `targetResponseCompleted`: the target agent responded through the platform,
   or stdout auto-capture recorded a fallback response through the same request
   response path.
-- `responseCaptureMode`: `claude_stdout_stream_json` when stdout auto-capture
-  was evaluated.
+- `responseCaptureMode`: `claude_stdout_stream_json` for CLI or
+  `claude_agent_sdk_result` for SDK.
 - `responseCaptureStatus`: `recorded`, `already_responded`,
   `no_response_text`, `request_not_active`, `respond_failed`, or
-  `not_attempted_command_failed`.
+  `not_attempted_command_failed`, `not_attempted_explicit_only`,
+  `not_attempted_provider_failed`, or `not_attempted_preflight_failed`.
+- `providerRuntimeMetadata`: SDK preflight/options/run summaries, including
+  typed event counts, optional-capability detection, result origin trust,
+  structured result-error context, conversation resets, permission denial,
+  interrupt/cleanup, and ambiguity.
 - `autoCapturedResponseSourceEventSequence`: present when stdout auto-capture
   wrote the request response.
 - `runtimeWakeTriggered`: true only when a provider command was started.
@@ -337,6 +473,9 @@ Important fields:
 ## Boundaries
 
 - Use `--resume <session uuid>` for exact registered-session activation.
+- Treat an SDK permission callback that reaches `ask` as denied and
+  interrupting in unattended activation. Only user-explicit SDK allowed-tools,
+  permission-mode, and settings inputs may change that posture.
 - Do not use `--continue` as the default exact target route.
 - Do not use `--fork-session`; it creates a different session.
 - Do not use `--no-session-persistence`; it breaks resume continuity.
@@ -347,3 +486,7 @@ Important fields:
   tokens, or keychain material in handle metadata.
 - Do not read, export, summarize, delete, migrate, or modify complete Claude
   Code session history.
+- Do not infer that `resume_session_at`, `resume_drops_turn`, `SessionStore`,
+  `forward_subagent_text`, or MCP 2.x support is enabled merely because the
+  installed SDK exposes it; this backend does not use those capability-expanding
+  surfaces.

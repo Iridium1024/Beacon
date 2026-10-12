@@ -23,6 +23,10 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 
+[project.optional-dependencies]
+claude-agent-sdk = ["claude-agent-sdk>=0.2.127,<0.3.0"]
+mcp = ["mcp>=2.2.0,<3"]
+
 [project.urls]
 Homepage = "https://github.com/Iridium1024/Beacon"
 Repository = "https://github.com/Iridium1024/Beacon"
@@ -30,6 +34,7 @@ Issues = "https://github.com/Iridium1024/Beacon/issues"
 
 [project.scripts]
 beacon = "agent_os.local_runtime:main"
+beacon-mcp = "agent_os.communication_mcp:main"
 
 [tool.setuptools.package-dir]
 "" = "src"

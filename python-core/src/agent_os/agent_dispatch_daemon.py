@@ -115,6 +115,58 @@ def _run_daemon(
     codex_app_server_approval_decision, _ = (
         _codex_app_server_approval_decision(args, local_profile)
     )
+    if application.communication_mode(workspace_id) == "core" and not args.once:
+        if args.dry_run:
+            _write_json(application.run_agent_dispatch_worker_once(workspace_id=workspace_id,
+                target_agent_id=args.target_agent_id, dispatch_id=args.dispatch_id, limit=args.limit, dry_run=True), pretty=True)
+            return 0
+        if args.dispatch_id is not None or args.target_agent_id is not None:
+            raise ValueError("core continuous consumer is workspace-scoped; use --once for a selected dispatch/target")
+        from agent_os.application.services.communication_runtime import RuntimeConfig
+        provider_options = {
+            "database_path": application.settings.database,
+            "workspace_root": application.settings.workspace_root,
+            "plugins_directory": application.settings.plugins_directory,
+            "config_path": args.config_path or application.settings.profile_path,
+            "handoff_directory": args.handoff_directory,
+            "platform_workspace_root": args.platform_workspace_root,
+            "claude_executable": args.claude_executable,
+            "claude_default_platform_workspace_add_dir": not args.no_claude_default_platform_workspace_add_dir,
+            "claude_add_dirs": tuple(args.claude_add_dir),
+            "claude_allowed_tools": tuple(args.claude_allowed_tool),
+            "claude_permission_mode": args.claude_permission_mode,
+            "claude_settings_path": args.claude_settings_path,
+            "claude_activation_backend": claude_control.activation_backend.value,
+            "claude_reply_writeback_mode": claude_control.reply_writeback_mode.value,
+            "codex_executable": args.codex_executable,
+            "codex_default_platform_workspace_add_dir": not args.no_codex_default_platform_workspace_add_dir,
+            "codex_add_dirs": tuple(args.codex_add_dir),
+            "codex_sandbox_mode": args.codex_sandbox_mode,
+            "codex_approval_policy": args.codex_approval_policy,
+            "codex_git_repo_check_policy": codex_repo_check_policy,
+            "codex_git_repo_check_policy_source": codex_repo_check_policy_source,
+            "codex_activation_backend": codex_control.activation_backend.value,
+            "codex_app_server_approval_decision": codex_app_server_approval_decision,
+            "codex_busy_delivery_policy": codex_control.busy_delivery_policy.value,
+            "codex_reply_writeback_mode": codex_control.reply_writeback_mode.value,
+            "hermes_executable": args.hermes_executable,
+            "hermes_home": args.hermes_home,
+            "hermes_activation_backend": hermes_control.activation_backend.value,
+            "hermes_reply_writeback_mode": hermes_control.reply_writeback_mode.value,
+            "hermes_gateway_python": hermes_control.gateway_python.value if hermes_control.gateway_python else None,
+            "hermes_source_tag": args.hermes_source_tag,
+            "hermes_max_turns": args.hermes_max_turns,
+            "compact_messages": args.compact_messages,
+        }
+        result = application.run_communication_consumer(workspace_id=workspace_id,
+            config=RuntimeConfig(concurrency=args.activation_concurrency, poll_interval=poll_interval_ms / 1000,
+                heartbeat_interval=heartbeat_interval_ms / 1000, consumer_lease=args.consumer_lease_seconds,
+                attempt_lease=args.lease_ttl_seconds, provider_timeout=args.activation_timeout_seconds,
+                shutdown_timeout=args.shutdown_timeout_seconds), provider_options=provider_options,
+            preflight=not args.ignore_busy_target, runtime_policy=args.runtime_status_policy,
+            target_agent_id=args.target_agent_id)
+        _write_json(result, pretty=True)
+        return 0
     started_at = _utc_now()
     process_hint = _process_hint(profile_path=profile_path)
     application.record_agent_dispatch_daemon_liveness(
@@ -191,6 +243,7 @@ def _run_daemon(
             ),
             hermes_source_tag=args.hermes_source_tag,
             hermes_max_turns=args.hermes_max_turns,
+            compact_messages=args.compact_messages,
             activation_timeout_seconds=args.activation_timeout_seconds,
             skip_busy_target=not args.ignore_busy_target,
             read_live_runtime_status=args.runtime_status_policy,
@@ -292,6 +345,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plugins-directory")
     parser.add_argument("--no-init-schema", action="store_true")
     parser.add_argument("--workspace-id")
+    parser.add_argument("--compact-messages", action="store_true",
+                        help="Opt in to Beacon-generated compact Agent message envelopes")
+    parser.add_argument("--activation-concurrency", type=int, default=2)
+    parser.add_argument("--consumer-lease-seconds", type=float, default=30)
+    parser.add_argument("--shutdown-timeout-seconds", type=float, default=10)
     parser.add_argument("--dispatch-id")
     parser.add_argument("--target-agent-id")
     parser.add_argument("--dispatcher-id", default="agent-dispatch-daemon")

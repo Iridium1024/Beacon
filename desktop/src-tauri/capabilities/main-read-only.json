@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-read-only",
+  "description": "The Beacon Desktop main window has no Tauri command or plugin permissions.",
+  "windows": ["main"],
+  "platforms": ["windows"],
+  "permissions": []
+}
